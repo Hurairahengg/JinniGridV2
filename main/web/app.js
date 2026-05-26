@@ -1,24 +1,14 @@
-// ═════════════════════════════════════════════════════════
-// JINNI GRID — Mission Control
-// ═════════════════════════════════════════════════════════
+// ═══ JINNI GRID — Mission Control ═══
 
 const state = {
-  workers: [],
-  activePage: "home",
-  feedItems: [],
-  chartWorker: null,
-  chart: null,
-  candleSeries: null,
-  chartBars: [],          // cached bars in lightweight-charts format
-  chartMarkers: [],
-  ws: null,
-  liveTrades: [],
+  workers: [], activePage: "home", feedItems: [],
+  chartWorker: null, chart: null, candleSeries: null,
+  chartBars: [], chartMarkers: [], ws: null,
 };
 
 const $  = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
 
-// ─── api ──────────────────────────────────────────────────
 const api = {
   get:  u    => fetch(u).then(r => r.json()),
   post: u    => fetch(u, {method:"POST"}).then(r => r.json()),
@@ -26,177 +16,170 @@ const api = {
                           body: JSON.stringify(b)}).then(r => r.json()),
 };
 
-// ─── format ──────────────────────────────────────────────
 const fmt = {
   money: v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Number(v).toFixed(2),
-  num:   (v, d=2) => v == null ? "—" : Number(v).toFixed(d),
-  pct:   v => v == null ? "—" : v.toFixed(1) + "%",
+  num:   (v,d=2) => v == null ? "—" : Number(v).toFixed(d),
+  pct:   v => v == null ? "—" : Number(v).toFixed(1) + "%",
   time:  v => v ? new Date(v).toLocaleTimeString("en-GB", {hour12:false}) : "—",
   short: v => v ? new Date(v).toLocaleTimeString("en-GB", {hour12:false}).slice(0,8) : "—",
+  big:   v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Number(v).toLocaleString("en-US", {maximumFractionDigits: 2}),
 };
 
-// ═════════════════════════════════════════════════════════
-// NAV
-// ═════════════════════════════════════════════════════════
-$$(".nav-item").forEach(btn => {
-  btn.onclick = () => navigate(btn.dataset.page);
+// ═══ THEME ═══
+const THEME_KEY = "jg-theme", ACCENT_KEY = "jg-accent", DENSITY_KEY = "jg-density";
+
+function applyTheme(name)   { document.documentElement.setAttribute("data-theme", name);  localStorage.setItem(THEME_KEY, name);   refreshChartThemes(); }
+function applyAccent(name)  { document.documentElement.setAttribute("data-accent", name); localStorage.setItem(ACCENT_KEY, name);  refreshChartThemes(); }
+function applyDensity(name) { document.documentElement.setAttribute("data-density", name); localStorage.setItem(DENSITY_KEY, name); }
+
+applyTheme  (localStorage.getItem(THEME_KEY)  || "midnight");
+applyDensity(localStorage.getItem(DENSITY_KEY) || "normal");
+const savedAccent = localStorage.getItem(ACCENT_KEY); if (savedAccent) applyAccent(savedAccent);
+
+const themePanel = $("#theme-panel");
+$("#theme-btn").onclick = e => { e.stopPropagation(); themePanel.classList.toggle("hidden"); markActiveTheme(); };
+document.addEventListener("click", e => {
+  if (!themePanel.contains(e.target) && e.target.id !== "theme-btn") themePanel.classList.add("hidden");
 });
+$$(".theme-swatch").forEach(b => b.onclick = () => { applyTheme(b.dataset.theme); markActiveTheme(); });
+$$(".accent-dot")  .forEach(b => b.onclick = () => { applyAccent(b.dataset.accent); markActiveTheme(); });
+$$(".density-btn") .forEach(b => b.onclick = () => { applyDensity(b.dataset.density); markActiveTheme(); });
+
+function markActiveTheme() {
+  const t = document.documentElement.dataset.theme;
+  const a = document.documentElement.dataset.accent || "";
+  const d = document.documentElement.dataset.density;
+  $$(".theme-swatch").forEach(b => b.classList.toggle("active", b.dataset.theme === t));
+  $$(".accent-dot") .forEach(b => b.classList.toggle("active", b.dataset.accent === a));
+  $$(".density-btn").forEach(b => b.classList.toggle("active", b.dataset.density === d));
+}
+
+function refreshChartThemes() {
+  setTimeout(() => {
+    if (equityChart) equityChart.applyOptions(chartBaseOpts($("#equity-chart")));
+    if (portEquityChart) portEquityChart.applyOptions(chartBaseOpts($("#port-equity")));
+    if (portDdChart) portDdChart.applyOptions(chartBaseOpts($("#port-dd")));
+    if (portHistChart) portHistChart.applyOptions(chartBaseOpts($("#port-hist")));
+    if (state.chart) state.chart.applyOptions(chartBaseOpts($("#live-chart")));
+  }, 30);
+}
+
+// ═══ NAV ═══
+$$(".nav-item").forEach(btn => btn.onclick = () => navigate(btn.dataset.page));
 
 function navigate(page) {
   state.activePage = page;
   $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
   $$(".page").forEach(p => p.classList.toggle("active", p.dataset.page === page));
-  if (page === "fleet")   loadFleet();
-  if (page === "trades")  loadTrades();
-  if (page === "logs")    loadLogs();
-  if (page === "config")  loadConfigList();
-  if (page === "charts")  initChartsPage();
+  if (page === "home")      loadHome();
+  if (page === "portfolio") loadPortfolio();
+  if (page === "fleet")     loadFleet();
+  if (page === "logs")      loadLogs();
+  if (page === "config")    loadConfigList();
+  if (page === "charts")    initChartsPage();
 }
 
-// ═════════════════════════════════════════════════════════
-// CLOCK
-// ═════════════════════════════════════════════════════════
-setInterval(() => {
-  const d = new Date();
-  $("#clock").textContent = d.toUTCString().slice(17, 25) + " UTC";
-}, 1000);
+// ═══ CLOCK ═══
+setInterval(() => { $("#clock").textContent = new Date().toUTCString().slice(17, 25) + " UTC"; }, 1000);
 
-// ═════════════════════════════════════════════════════════
-// WEBSOCKET
-// ═════════════════════════════════════════════════════════
+// ═══ WS ═══
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/ui`);
   state.ws = ws;
-
-  ws.onopen = () => {
-    $("#conn-pill").classList.remove("off");
-    $("#conn-text").textContent = "live";
-  };
-  ws.onclose = () => {
-    $("#conn-pill").classList.add("off");
-    $("#conn-text").textContent = "reconnecting";
-    setTimeout(connectWS, 2000);
-  };
-  ws.onmessage = e => handleWSMessage(JSON.parse(e.data));
+  ws.onopen  = () => { $("#conn-pill").classList.remove("off"); $("#conn-text").textContent = "live"; };
+  ws.onclose = () => { $("#conn-pill").classList.add("off");    $("#conn-text").textContent = "reconnecting"; setTimeout(connectWS, 2000); };
+  ws.onmessage = e => handleWS(JSON.parse(e.data));
 }
 
-function handleWSMessage(msg) {
+function handleWS(msg) {
   const t = msg.type;
-
   if (t === "heartbeat" || t === "worker.update") {
-    loadFleet({silent: true});
-    if (state.activePage === "home") loadHome();
-    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) {
-      updateChartSideFromHeartbeat(msg.payload);
-    }
+    if (state.activePage === "home")  loadHome();
+    if (state.activePage === "fleet") loadFleet({silent:true});
+    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) updateSideFromHB(msg.payload);
   }
-
   if (t === "trade.opened") {
-    pushFeed("trade-opened", msg.worker_id,
-      `OPEN ${msg.payload.dir === 1 ? "▲ LONG" : "▼ SHORT"} ${msg.payload.symbol} @ ${fmt.num(msg.payload.actual_entry)}`);
-    if (state.activePage === "home") loadHome();
-    if (state.activePage === "trades") loadTrades();
-    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) {
-      addChartMarker(msg.payload, "open");
-      pushFill(msg.payload, "open");
-    }
-    toast("info", `Trade opened on ${msg.worker_id}`);
+    pushFeed("trade-opened", msg.worker_id, `OPEN ${msg.payload.dir === 1 ? "▲ LONG" : "▼ SHORT"} ${msg.payload.symbol} @ ${fmt.num(msg.payload.actual_entry)}`);
+    if (state.activePage === "home")      loadHome();
+    if (state.activePage === "portfolio") loadPortfolio();
+    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartMarker(msg.payload, "open"); pushFill(msg.payload, "open"); }
+    toast("info", `${msg.worker_id}: trade opened`);
   }
-
   if (t === "trade.closed") {
     const p = msg.payload;
     const cls = (p.net_pnl || 0) >= 0 ? "trade-closed-win" : "trade-closed-loss";
-    pushFeed(cls, msg.worker_id,
-      `CLOSE ${p.symbol} · ${fmt.money(p.net_pnl)} · ${p.hit_sl ? "SL" : "TP"}`);
-    if (state.activePage === "home")   loadHome();
-    if (state.activePage === "trades") loadTrades();
-    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) {
-      addChartMarker(p, "close");
-      pushFill(p, "close");
-    }
-    toast(p.net_pnl >= 0 ? "success" : "error",
-          `${msg.worker_id}: ${fmt.money(p.net_pnl)}`);
+    pushFeed(cls, msg.worker_id, `CLOSE ${p.symbol} · ${fmt.money(p.net_pnl)} · ${p.hit_sl ? "SL" : "TP"}`);
+    if (state.activePage === "home")      loadHome();
+    if (state.activePage === "portfolio") loadPortfolio();
+    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartMarker(p, "close"); pushFill(p, "close"); }
+    toast(p.net_pnl >= 0 ? "success" : "error", `${msg.worker_id}: ${fmt.money(p.net_pnl)}`);
   }
-
-  if (t === "log") {
-    if (state.activePage === "logs") appendLogLive(msg);
-  }
-
-  if (t === "error") {
-    pushFeed("error", msg.worker_id, msg.payload.message);
-    toast("error", `[${msg.worker_id}] ${msg.payload.message}`);
-  }
-
-  if (t === "bar") {
-    if (state.activePage === "charts" && msg.worker_id === state.chartWorker) {
-      addChartBar(msg.payload.bar);
-      updateChartSideFromBar(msg.payload);
-    }
-  }
+  if (t === "log")   { if (state.activePage === "logs") appendLogLive(msg); }
+  if (t === "error") { pushFeed("error", msg.worker_id, msg.payload.message); toast("error", `[${msg.worker_id}] ${msg.payload.message}`); }
+  if (t === "bar")   { if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartBar(msg.payload.bar); updateSideFromBar(msg.payload); } }
 }
 
-// ═════════════════════════════════════════════════════════
-// FEED
-// ═════════════════════════════════════════════════════════
+// ═══ FEED ═══
 function pushFeed(cls, worker, msg) {
-  const item = { cls, worker, msg, ts: new Date() };
-  state.feedItems.unshift(item);
+  state.feedItems.unshift({cls, worker, msg, ts: new Date()});
   state.feedItems = state.feedItems.slice(0, 80);
   renderFeed();
 }
 function renderFeed() {
-  const el = $("#activity-feed");
-  if (!el) return;
+  const el = $("#activity-feed"); if (!el) return;
   el.innerHTML = state.feedItems.map(i => `
     <div class="feed-item ${i.cls}">
       <span class="feed-time">${fmt.short(i.ts)}</span>
-      <div class="feed-body">
-        <span class="feed-worker">${i.worker || "—"}</span>${escapeHtml(i.msg)}
-      </div>
+      <div class="feed-body"><span class="feed-worker">${i.worker || "—"}</span>${escapeHtml(i.msg)}</div>
     </div>`).join("");
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-// ═════════════════════════════════════════════════════════
-// TOASTS
-// ═════════════════════════════════════════════════════════
+// ═══ TOASTS ═══
 function toast(kind, msg) {
   const el = document.createElement("div");
-  el.className = `toast ${kind}`;
-  el.textContent = msg;
+  el.className = `toast ${kind}`; el.textContent = msg;
   $("#toast-stack").appendChild(el);
   setTimeout(() => { el.style.opacity = "0"; el.style.transform = "translateX(20px)"; }, 3200);
   setTimeout(() => el.remove(), 3600);
 }
 
-// ═════════════════════════════════════════════════════════
-// HOME / MISSION CONTROL
-// ═════════════════════════════════════════════════════════
-let equityChart = null, equitySeries = null;
+// ═══ CHART OPTS (theme-aware) ═══
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function chartBaseOpts(el) {
+  return {
+    width: el ? el.clientWidth : 600,
+    height: el ? el.clientHeight : 300,
+    layout: { background: { color: "transparent" }, textColor: cssVar("--text-2"), fontFamily: "JetBrains Mono" },
+    grid: { vertLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" }, horzLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" } },
+    rightPriceScale: { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)" },
+    timeScale:       { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)", timeVisible: true, secondsVisible: false },
+    crosshair: { mode: 1 },
+  };
+}
 
+// ═══ HOME ═══
+let equityChart = null, equitySeries = null;
 async function loadHome() {
   const [workers, portfolio, equity] = await Promise.all([
     api.get("/api/workers"), api.get("/api/portfolio"), api.get("/api/equity"),
   ]);
   state.workers = workers;
 
-  // KPIs
   const pnlEl = $("#kpi-pnl").querySelector(".kpi-value");
   pnlEl.textContent = fmt.money(portfolio.net_pnl);
   pnlEl.classList.toggle("positive", portfolio.net_pnl > 0);
   pnlEl.classList.toggle("negative", portfolio.net_pnl < 0);
   $("#kpi-wr").querySelector(".kpi-value").textContent = fmt.pct(portfolio.win_rate);
   $("#kpi-wl").textContent = `${portfolio.wins} W / ${portfolio.losses} L`;
-
   const running = workers.filter(w => w.state === "RUNNING").length;
   $("#kpi-fleet").querySelector(".kpi-value").textContent = `${running} / ${workers.length}`;
   const positions = workers.reduce((s,w) => s + (w.open_positions || 0), 0);
   $("#kpi-positions").querySelector(".kpi-value").textContent = positions;
 
-  // Fleet pulse
   $("#fleet-pulse-sub").textContent = `${running} active · ${workers.length} total`;
   $("#fleet-pulse").innerHTML = workers.map(w => `
     <div class="pulse-card">
@@ -208,48 +191,162 @@ async function loadHome() {
       <div class="pulse-balance">${w.last_balance != null ? "$" + Number(w.last_balance).toFixed(0) : "—"}</div>
     </div>`).join("") || `<div style="padding:20px;color:var(--text-3);font-size:12px">no workers registered</div>`;
 
-  renderEquity(equity);
+  renderHomeEquity(equity);
 }
 
-function renderEquity(equity) {
-  const el = $("#equity-chart");
-  if (!el) return;
+function renderHomeEquity(equity) {
+  const el = $("#equity-chart"); if (!el) return;
   if (!equityChart) {
-    equityChart = LightweightCharts.createChart(el, equityChartOpts(el));
+    equityChart = LightweightCharts.createChart(el, chartBaseOpts(el));
     equitySeries = equityChart.addAreaSeries({
-      lineColor: "rgba(0, 217, 255, 1)",
-      topColor:  "rgba(0, 217, 255, 0.35)",
-      bottomColor: "rgba(0, 217, 255, 0.02)",
+      lineColor: cssVar("--accent"),
+      topColor:  "color-mix(in srgb, " + cssVar("--accent") + " 35%, transparent)",
+      bottomColor:"color-mix(in srgb, " + cssVar("--accent") + " 2%, transparent)",
       lineWidth: 2,
     });
     new ResizeObserver(() => equityChart.resize(el.clientWidth, el.clientHeight)).observe(el);
   }
   const data = equity.map((e, i) => ({
-    time: Math.floor(new Date(e.ts || Date.now()).getTime() / 1000) + i,  // ensure strictly increasing
+    time: Math.floor(new Date(e.ts || Date.now()).getTime() / 1000) + i,
     value: e.cum,
   }));
   equitySeries.setData(data);
   if (data.length) equityChart.timeScale().fitContent();
 }
-function equityChartOpts(el) {
-  return {
-    width: el.clientWidth, height: el.clientHeight,
-    layout: { background: { color: "transparent" }, textColor: "#8b95ad", fontFamily: "JetBrains Mono" },
-    grid: { vertLines: { color: "rgba(255,255,255,0.04)" }, horzLines: { color: "rgba(255,255,255,0.04)" } },
-    rightPriceScale: { borderColor: "rgba(255,255,255,0.08)" },
-    timeScale:       { borderColor: "rgba(255,255,255,0.08)", timeVisible: true, secondsVisible: false },
-    crosshair: { mode: 1 },
-  };
+
+// ═══ PORTFOLIO ═══
+let portEquityChart = null, portEquitySeries = null;
+let portDdChart = null, portDdSeries = null;
+let portHistChart = null, portHistSeries = null;
+
+async function loadPortfolio() {
+  const [p, equity] = await Promise.all([api.get("/api/portfolio"), api.get("/api/equity")]);
+  renderMetrics(p);
+  renderPortfolioEquity(equity);
+  renderDrawdown(equity);
+  renderByWorker(p.by_worker || []);
+  renderHistogram(equity);
+  loadTrades();
 }
 
-// ═════════════════════════════════════════════════════════
-// FLEET PAGE
-// ═════════════════════════════════════════════════════════
-async function loadFleet(opts = {}) {
+function renderMetrics(p) {
+  const cell = (label, value, sub, kind="") => `
+    <div class="metric">
+      <div class="metric-label">${label}</div>
+      <div class="metric-value ${kind}">${value}</div>
+      ${sub ? `<div class="metric-sub">${sub}</div>` : ""}
+    </div>`;
+  const pnlKind = p.net_pnl > 0 ? "pos" : (p.net_pnl < 0 ? "neg" : "");
+  const ddKind  = p.max_drawdown > 0 ? "neg" : "";
+  const strkKind= p.current_streak_kind === "win" ? "pos" : (p.current_streak_kind === "loss" ? "neg" : "");
+  $("#metric-grid").innerHTML = [
+    cell("Net PnL",        fmt.big(p.net_pnl),                       `${p.n_trades} trades`, pnlKind),
+    cell("Win Rate",       fmt.pct(p.win_rate),                       `${p.wins} W · ${p.losses} L`),
+    cell("Profit Factor",  isFinite(p.profit_factor) ? p.profit_factor.toFixed(2) : "∞", "gross win / gross loss"),
+    cell("Expectancy",     fmt.money(p.expectancy),                    "avg per trade", p.expectancy > 0 ? "pos" : (p.expectancy < 0 ? "neg" : "")),
+    cell("Avg Win",        fmt.money(p.avg_win),                       "per winning trade", "pos"),
+    cell("Avg Loss",       fmt.money(p.avg_loss),                      "per losing trade",  "neg"),
+    cell("Best Trade",     fmt.money(p.best_trade),                    "single max",        "pos"),
+    cell("Worst Trade",    fmt.money(p.worst_trade),                   "single min",        "neg"),
+    cell("Max Drawdown",   fmt.money(-p.max_drawdown),                 `${p.max_dd_pct.toFixed(1)}% from peak`, ddKind),
+    cell("Sharpe (per-tr)",p.sharpe.toFixed(2),                        "per-trade ratio"),
+    cell("Avg R",          p.avg_r.toFixed(2) + "R",                   "risk-multiple"),
+    cell("Avg Hold",       p.avg_bars_held.toFixed(1),                 "bars per trade"),
+    cell("Longest Win",    p.longest_win_streak + "",                  "consecutive wins",  "pos"),
+    cell("Longest Loss",   p.longest_loss_streak + "",                 "consecutive losses","neg"),
+    cell("Current Streak", (p.current_streak || 0) + " " + (p.current_streak_kind || ""),  "live", strkKind),
+    cell("Commission",     "$" + p.total_commission.toFixed(2),         "total paid"),
+  ].join("");
+}
+
+function renderPortfolioEquity(equity) {
+  const el = $("#port-equity"); if (!el) return;
+  if (!portEquityChart) {
+    portEquityChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portEquitySeries = portEquityChart.addAreaSeries({
+      lineColor: cssVar("--success"),
+      topColor:  "color-mix(in srgb, " + cssVar("--success") + " 30%, transparent)",
+      bottomColor:"color-mix(in srgb, " + cssVar("--success") + " 2%, transparent)",
+      lineWidth: 2,
+    });
+    new ResizeObserver(() => portEquityChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+  }
+  const data = equity.map((e, i) => ({ time: i + 1, value: e.cum }));
+  portEquitySeries.setData(data);
+  if (data.length) portEquityChart.timeScale().fitContent();
+}
+
+function renderDrawdown(equity) {
+  const el = $("#port-dd"); if (!el) return;
+  if (!portDdChart) {
+    portDdChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portDdSeries = portDdChart.addAreaSeries({
+      lineColor: cssVar("--danger"),
+      topColor:  "color-mix(in srgb, " + cssVar("--danger") + " 2%, transparent)",
+      bottomColor:"color-mix(in srgb, " + cssVar("--danger") + " 30%, transparent)",
+      lineWidth: 2,
+    });
+    new ResizeObserver(() => portDdChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+  }
+  let peak = 0; const data = equity.map((e, i) => {
+    if (e.cum > peak) peak = e.cum;
+    return { time: i + 1, value: -(peak - e.cum) };
+  });
+  portDdSeries.setData(data);
+  if (data.length) portDdChart.timeScale().fitContent();
+}
+
+function renderByWorker(byW) {
+  const el = $("#port-by-worker"); if (!el) return;
+  if (!byW.length) { el.innerHTML = `<div style="color:var(--text-3);font-size:12px">no trades yet</div>`; return; }
+  const maxAbs = Math.max(...byW.map(w => Math.abs(w.net_pnl))) || 1;
+  el.innerHTML = byW.map(w => {
+    const pct = Math.abs(w.net_pnl) / maxAbs * 100;
+    const kind = w.net_pnl >= 0 ? "pos" : "neg";
+    return `
+      <div class="bw-row">
+        <div class="bw-id">${w.worker_id}</div>
+        <div class="bw-bar"><div class="bw-fill ${kind}" style="width:${pct}%"></div></div>
+        <div class="bw-val ${kind}">${fmt.money(w.net_pnl)}<br><span style="color:var(--text-3);font-size:10px">${w.trades}t · ${w.win_rate}%</span></div>
+      </div>`;
+  }).join("");
+}
+
+function renderHistogram(equity) {
+  const el = $("#port-hist"); if (!el) return;
+  if (!portHistChart) {
+    portHistChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portHistSeries = portHistChart.addHistogramSeries({ priceFormat: { type: "volume" } });
+    new ResizeObserver(() => portHistChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+  }
+  const pnls = equity.map(e => e.pnl || 0).filter(p => p !== 0);
+  if (!pnls.length) { portHistSeries.setData([]); return; }
+  // bucket into 14 buckets
+  const min = Math.min(...pnls), max = Math.max(...pnls);
+  const buckets = 14;
+  const step = (max - min) / buckets || 1;
+  const counts = new Array(buckets).fill(0);
+  pnls.forEach(p => {
+    const i = Math.min(buckets - 1, Math.floor((p - min) / step));
+    counts[i] += 1;
+  });
+  const data = counts.map((c, i) => {
+    const center = min + step * (i + 0.5);
+    return {
+      time: i + 1,
+      value: c,
+      color: center >= 0 ? cssVar("--success") : cssVar("--danger"),
+    };
+  });
+  portHistSeries.setData(data);
+  portHistChart.timeScale().fitContent();
+}
+
+// ═══ FLEET ═══
+async function loadFleet() {
   const workers = await api.get("/api/workers");
   state.workers = workers;
-  const grid = $("#fleet-grid");
-  if (!grid) return;
+  const grid = $("#fleet-grid"); if (!grid) return;
   grid.innerHTML = workers.map(w => `
     <div class="worker-card">
       <div class="worker-card-head">
@@ -284,17 +381,15 @@ async function cmd(id, action) {
   loadFleet();
 }
 
-// ═════════════════════════════════════════════════════════
-// TRADES PAGE
-// ═════════════════════════════════════════════════════════
+// ═══ TRADES (now embedded in portfolio) ═══
 async function loadTrades() {
-  const wid = $("#trade-filter-worker").value.trim();
-  const st  = $("#trade-filter-status").value;
+  const wEl = $("#trade-filter-worker"); const sEl = $("#trade-filter-status");
+  const wid = wEl ? wEl.value.trim() : ""; const st = sEl ? sEl.value : "";
   const qs = new URLSearchParams({limit: 200});
   if (wid) qs.set("worker_id", wid);
   if (st)  qs.set("status", st);
   const rows = await api.get("/api/trades?" + qs);
-  const tb = $("#trades-table tbody");
+  const tb = $("#trades-table tbody"); if (!tb) return;
   tb.innerHTML = rows.map(t => `
     <tr class="${(t.net_pnl||0)>0?"win":(t.net_pnl||0)<0?"loss":""}">
       <td>${t.id}</td>
@@ -308,6 +403,7 @@ async function loadTrades() {
       <td>${fmt.num(t.lots)}</td>
       <td class="pnl">${t.net_pnl != null ? fmt.money(t.net_pnl) : "—"}</td>
       <td>${t.r_multiple != null ? t.r_multiple.toFixed(2)+"R" : "—"}</td>
+      <td>${t.bars_held ?? "—"}</td>
       <td>${verdictHtml(t.validator_verdict)}</td>
     </tr>`).join("");
 }
@@ -316,12 +412,16 @@ function verdictHtml(v) {
   if (v.match) return `<span class="verdict-ok">✓ match</span>`;
   return `<span class="verdict-bad" title="${escapeHtml(v.reason||"")}">⚠ ${(v.reason||"").slice(0,30)}</span>`;
 }
-$("#trade-filter-worker")?.addEventListener("input", () => clearTimeout(window._tf) || (window._tf = setTimeout(loadTrades, 300)));
-$("#trade-filter-status")?.addEventListener("change", loadTrades);
+document.addEventListener("input", e => {
+  if (e.target.id === "trade-filter-worker") { clearTimeout(window._tf); window._tf = setTimeout(loadTrades, 300); }
+  if (e.target.id === "log-filter-worker")   { clearTimeout(window._lf); window._lf = setTimeout(loadLogs, 300); }
+});
+document.addEventListener("change", e => {
+  if (e.target.id === "trade-filter-status") loadTrades();
+  if (e.target.id === "log-filter-level")    loadLogs();
+});
 
-// ═════════════════════════════════════════════════════════
-// CHARTS PAGE
-// ═════════════════════════════════════════════════════════
+// ═══ CHARTS PAGE ═══
 async function initChartsPage() {
   const workers = await api.get("/api/workers");
   state.workers = workers;
@@ -329,60 +429,51 @@ async function initChartsPage() {
   sel.innerHTML = workers.map(w => `<option value="${w.id}">${w.id} · ${w.state}</option>`).join("");
   sel.onchange = () => rebindChart();
   if (!state.chartWorker && workers.length) state.chartWorker = workers[0].id;
-  if (state.chartWorker) {
-    sel.value = state.chartWorker;
-    rebindChart();
-  }
+  if (state.chartWorker) { sel.value = state.chartWorker; rebindChart(); }
 }
 
 async function rebindChart() {
   const wid = $("#chart-worker").value;
   state.chartWorker = wid;
-  state.chartBars = []; state.chartMarkers = []; state.liveTrades = [];
+  state.chartBars = []; state.chartMarkers = [];
   $("#chart-fills").innerHTML = "";
 
   const el = $("#live-chart");
   if (!state.chart) {
-    state.chart = LightweightCharts.createChart(el, equityChartOpts(el));
+    state.chart = LightweightCharts.createChart(el, chartBaseOpts(el));
     state.candleSeries = state.chart.addCandlestickSeries({
-      upColor: "#00ffae", downColor: "#ff3b6b",
-      wickUpColor: "#00ffae", wickDownColor: "#ff3b6b",
+      upColor: cssVar("--success"), downColor: cssVar("--danger"),
+      wickUpColor: cssVar("--success"), wickDownColor: cssVar("--danger"),
       borderVisible: false,
     });
     new ResizeObserver(() => state.chart.resize(el.clientWidth, el.clientHeight)).observe(el);
   }
 
   const { bars, markers } = await api.get(`/api/bars/${wid}`);
-  state.chartBars   = bars.map(toCandle);
+  state.chartBars = bars.map(toCandle);
   state.candleSeries.setData(state.chartBars);
   const lwMarkers = markers.map(toMarker).filter(Boolean);
   state.chartMarkers = lwMarkers;
   state.candleSeries.setMarkers(lwMarkers);
   state.chart.timeScale().fitContent();
 
-  // initial side-panel data
   const w = state.workers.find(x => x.id === wid);
-  if (w) updateChartSideFromHeartbeat(w);
+  if (w) updateSideFromHB(w);
 }
 
-function toCandle(b) {
-  return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close };
-}
+function toCandle(b) { return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; }
 function toMarker(m) {
   if (!m.ts) return null;
   return {
     time: Math.floor(new Date(m.ts).getTime() / 1000),
     position: m.type === "open" ? (m.dir === 1 ? "belowBar" : "aboveBar") : "inBar",
-    color:    m.type === "open" ? "#00d9ff" : ((m.net_pnl || 0) >= 0 ? "#00ffae" : "#ff3b6b"),
+    color:    m.type === "open" ? cssVar("--accent") : ((m.net_pnl || 0) >= 0 ? cssVar("--success") : cssVar("--danger")),
     shape:    m.type === "open" ? (m.dir === 1 ? "arrowUp" : "arrowDown") : "circle",
     text:     m.type === "open" ? `#${m.ticket}` : `${(m.net_pnl||0)>=0?"+":""}${Number(m.net_pnl||0).toFixed(0)}`,
   };
 }
 
-function addChartBar(bar) {
-  if (!state.candleSeries) return;
-  state.candleSeries.update(toCandle(bar));
-}
+function addChartBar(bar) { if (state.candleSeries) state.candleSeries.update(toCandle(bar)); }
 function addChartMarker(trade, type) {
   if (!state.candleSeries) return;
   const m = toMarker({
@@ -395,12 +486,12 @@ function addChartMarker(trade, type) {
   state.chartMarkers.push(m);
   state.candleSeries.setMarkers(state.chartMarkers.slice(-100));
 }
-function updateChartSideFromBar(p) {
+function updateSideFromBar(p) {
   $("#chart-engine").textContent   = p.engine_state || "—";
   $("#chart-livebars").textContent = p.live_bars_seen ?? 0;
   $("#chart-lastts").textContent   = p.bar ? new Date(p.bar.time * 1000).toLocaleTimeString() : "—";
 }
-function updateChartSideFromHeartbeat(p) {
+function updateSideFromHB(p) {
   $("#chart-balance").textContent = p.last_balance ?? p.balance ?? "—";
   $("#chart-equity").textContent  = p.last_equity  ?? p.equity  ?? "—";
   $("#chart-ticket").textContent  = p.open_ticket || "—";
@@ -408,11 +499,10 @@ function updateChartSideFromHeartbeat(p) {
   $("#chart-livebars").textContent = p.live_bars_seen ?? 0;
 }
 function pushFill(trade, kind) {
-  const el = $("#chart-fills");
-  if (!el) return;
+  const el = $("#chart-fills"); if (!el) return;
   const isClose = kind === "close";
   const cls = isClose ? ((trade.net_pnl||0) >= 0 ? "win" : "loss") : "";
-  const html = `
+  el.insertAdjacentHTML("afterbegin", `
     <div class="fill ${cls}">
       <div class="fill-row"><b>${isClose ? "CLOSE" : "OPEN"} #${trade.ticket}</b>
         <span>${trade.dir===1?"LONG":"SHORT"}</span></div>
@@ -420,13 +510,10 @@ function pushFill(trade, kind) {
         <span>${isClose ? fmt.num(trade.actual_exit) : fmt.num(trade.actual_entry)}</span>
         <b>${isClose ? fmt.money(trade.net_pnl) : ""}</b>
       </div>
-    </div>`;
-  el.insertAdjacentHTML("afterbegin", html);
+    </div>`);
 }
 
-// ═════════════════════════════════════════════════════════
-// LOGS PAGE
-// ═════════════════════════════════════════════════════════
+// ═══ LOGS ═══
 async function loadLogs() {
   const w = $("#log-filter-worker").value.trim();
   const l = $("#log-filter-level").value;
@@ -435,7 +522,7 @@ async function loadLogs() {
   if (l) qs.set("level", l);
   const rows = await api.get("/api/logs?" + qs);
   const el = $("#logs-out");
-  el.innerHTML = rows.reverse().map(r => logLineHtml(r)).join("");
+  el.innerHTML = rows.reverse().map(logLineHtml).join("");
   if ($("#log-autoscroll").checked) el.scrollTop = el.scrollHeight;
 }
 function logLineHtml(r) {
@@ -460,12 +547,8 @@ function appendLogLive(msg) {
   }));
   if ($("#log-autoscroll").checked) el.scrollTop = el.scrollHeight;
 }
-$("#log-filter-worker")?.addEventListener("input", () => clearTimeout(window._lf) || (window._lf = setTimeout(loadLogs, 300)));
-$("#log-filter-level")?.addEventListener("change", loadLogs);
 
-// ═════════════════════════════════════════════════════════
-// CONFIG PAGE
-// ═════════════════════════════════════════════════════════
+// ═══ CONFIG ═══
 async function loadConfigList() {
   const ids = await api.get("/api/configs");
   const sel = $("#config-select");
@@ -486,27 +569,23 @@ async function saveConfig() {
   toast(r.ok ? "success" : "error", r.ok ? `${id} saved & pushed` : "save failed");
 }
 
-// ═════════════════════════════════════════════════════════
-// COMMAND PALETTE
-// ═════════════════════════════════════════════════════════
+// ═══ COMMAND PALETTE ═══
 const palette = $("#cmd-palette");
 const cmdInput = $("#cmd-input");
 const cmdResults = $("#cmd-results");
 let cmdSel = 0;
 
 const cmdActions = [
-  {ico: "◉", label: "Go to Mission Control", sub: "home", fn: () => navigate("home")},
-  {ico: "▦", label: "Go to Fleet",           sub: "fleet", fn: () => navigate("fleet")},
-  {ico: "↯", label: "Go to Trades",          sub: "trades", fn: () => navigate("trades")},
-  {ico: "▲", label: "Go to Live Charts",     sub: "charts", fn: () => navigate("charts")},
-  {ico: "≡", label: "Go to Logs",            sub: "logs", fn: () => navigate("logs")},
-  {ico: "◈", label: "Go to Configs",         sub: "config", fn: () => navigate("config")},
+  {ico: "◉", label: "Go to Mission Control", sub: "home",      fn: () => navigate("home")},
+  {ico: "$", label: "Go to Portfolio",       sub: "portfolio", fn: () => navigate("portfolio")},
+  {ico: "▦", label: "Go to Fleet",           sub: "fleet",     fn: () => navigate("fleet")},
+  {ico: "▲", label: "Go to Live Charts",     sub: "charts",    fn: () => navigate("charts")},
+  {ico: "≡", label: "Go to Logs",            sub: "logs",      fn: () => navigate("logs")},
+  {ico: "◈", label: "Go to Configs",         sub: "config",    fn: () => navigate("config")},
+  {ico: "◐", label: "Toggle theme panel",    sub: "theme",     fn: () => $("#theme-panel").classList.toggle("hidden")},
 ];
 
-function openPalette() {
-  palette.classList.remove("hidden");
-  cmdInput.value = ""; cmdInput.focus(); renderCmd("");
-}
+function openPalette()  { palette.classList.remove("hidden"); cmdInput.value = ""; cmdInput.focus(); renderCmd(""); }
 function closePalette() { palette.classList.add("hidden"); }
 $("#cmd-trigger").onclick = openPalette;
 window.addEventListener("keydown", e => {
@@ -530,10 +609,14 @@ function currentResults() {
     {ico: "▶", label: `Start ${w.id}`,   sub: "worker action", fn: () => cmd(w.id, "start")},
     {ico: "■", label: `Stop ${w.id}`,    sub: "worker action", fn: () => cmd(w.id, "stop")},
     {ico: "⟳", label: `Restart ${w.id}`, sub: "worker action", fn: () => cmd(w.id, "restart")},
+    {ico: "↻", label: `Reload config ${w.id}`, sub: "worker action", fn: () => cmd(w.id, "reload_config")},
   ]));
-  const all = [...cmdActions, ...workerActions];
+  const themeActions = ["midnight","abyss","terminal","paper","daylight"].map(t => (
+    {ico: "◐", label: `Theme: ${t}`, sub: "appearance", fn: () => { applyTheme(t); markActiveTheme(); }}
+  ));
+  const all = [...cmdActions, ...themeActions, ...workerActions];
   if (!q) return all.slice(0, 10);
-  return all.filter(a => a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q)).slice(0, 12);
+  return all.filter(a => a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q)).slice(0, 14);
 }
 function renderCmd(_q, reset = true) {
   if (reset) cmdSel = 0;
@@ -549,10 +632,7 @@ function renderCmd(_q, reset = true) {
   });
 }
 
-// ═════════════════════════════════════════════════════════
-// BOOT
-// ═════════════════════════════════════════════════════════
+// ═══ BOOT ═══
 connectWS();
 loadHome();
-loadFleet({silent: true});
 setInterval(() => { if (state.activePage === "home") loadHome(); }, 8000);

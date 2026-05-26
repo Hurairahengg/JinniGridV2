@@ -235,21 +235,102 @@ def list_trades(worker_id=None, limit=100, status=None):
 
 
 def portfolio_stats():
-    """Quick aggregate across all closed trades."""
+    """Comprehensive analytics across all closed trades."""
     with db_session() as s:
-        rows = s.query(Trade).filter_by(status="closed").all()
-        n = len(rows)
-        if n == 0:
-            return {"n_trades": 0, "net_pnl": 0.0, "win_rate": 0.0, "wins": 0, "losses": 0}
-        wins = sum(1 for r in rows if (r.net_pnl or 0) > 0)
-        net  = sum((r.net_pnl or 0) for r in rows)
-        return {
-            "n_trades": n,
-            "net_pnl":  round(net, 2),
-            "win_rate": round(100.0 * wins / n, 2),
-            "wins":     wins,
-            "losses":   n - wins,
-        }
+        rows = s.query(Trade).filter_by(status="closed").order_by(Trade.exit_time).all()
+
+    n = len(rows)
+    base = {
+        "n_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+        "net_pnl": 0.0, "gross_pnl": 0.0, "total_commission": 0.0,
+        "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+        "avg_trade": 0.0, "expectancy": 0.0,
+        "best_trade": 0.0, "worst_trade": 0.0,
+        "max_drawdown": 0.0, "max_dd_pct": 0.0,
+        "avg_r": 0.0, "avg_bars_held": 0.0,
+        "longest_win_streak": 0, "longest_loss_streak": 0,
+        "current_streak": 0, "current_streak_kind": "—",
+        "sharpe": 0.0,
+        "by_worker": [],
+    }
+    if n == 0:
+        return base
+
+    pnls   = [(r.net_pnl or 0) for r in rows]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    rs     = [(r.r_multiple or 0) for r in rows]
+    bars   = [(r.bars_held or 0) for r in rows]
+
+    gross_win  = sum(wins)
+    gross_loss = abs(sum(losses))
+    net        = sum(pnls)
+    commission = sum((r.commission or 0) for r in rows)
+
+    # ─── drawdown ───
+    peak = 0.0; cum = 0.0; max_dd = 0.0; dd_pct = 0.0
+    for p in pnls:
+        cum += p
+        if cum > peak: peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+            dd_pct = (dd / peak * 100) if peak > 0 else 0.0
+
+    # ─── streaks ───
+    longest_w = longest_l = cur_w = cur_l = 0
+    for p in pnls:
+        if p > 0: cur_w += 1; cur_l = 0; longest_w = max(longest_w, cur_w)
+        elif p < 0: cur_l += 1; cur_w = 0; longest_l = max(longest_l, cur_l)
+    last_kind = "win" if pnls and pnls[-1] > 0 else ("loss" if pnls and pnls[-1] < 0 else "—")
+    current_streak = cur_w if last_kind == "win" else cur_l
+
+    # ─── sharpe-ish (per-trade) ───
+    if n > 1:
+        mean = sum(pnls) / n
+        var = sum((p - mean) ** 2 for p in pnls) / (n - 1)
+        std = var ** 0.5
+        sharpe = (mean / std) if std > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    # ─── per-worker breakdown ───
+    by_w = {}
+    for r in rows:
+        d = by_w.setdefault(r.worker_id, {"worker_id": r.worker_id, "trades": 0, "wins": 0, "net_pnl": 0.0})
+        d["trades"] += 1
+        d["net_pnl"] += (r.net_pnl or 0)
+        if (r.net_pnl or 0) > 0: d["wins"] += 1
+    for d in by_w.values():
+        d["win_rate"] = round(100 * d["wins"] / d["trades"], 1) if d["trades"] else 0.0
+        d["net_pnl"] = round(d["net_pnl"], 2)
+
+    return {
+        "n_trades":            n,
+        "wins":                len(wins),
+        "losses":              len(losses),
+        "win_rate":            round(100 * len(wins) / n, 2),
+        "net_pnl":             round(net, 2),
+        "gross_pnl":           round(net + commission, 2),
+        "total_commission":    round(commission, 2),
+        "profit_factor":       round(gross_win / gross_loss, 2) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0),
+        "avg_win":             round(sum(wins) / len(wins), 2) if wins else 0.0,
+        "avg_loss":            round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "avg_trade":           round(net / n, 2),
+        "expectancy":          round(net / n, 2),
+        "best_trade":          round(max(pnls), 2),
+        "worst_trade":         round(min(pnls), 2),
+        "max_drawdown":        round(max_dd, 2),
+        "max_dd_pct":          round(dd_pct, 2),
+        "avg_r":               round(sum(rs) / n, 2) if rs else 0.0,
+        "avg_bars_held":       round(sum(bars) / n, 1) if bars else 0.0,
+        "longest_win_streak":  longest_w,
+        "longest_loss_streak": longest_l,
+        "current_streak":      current_streak,
+        "current_streak_kind": last_kind,
+        "sharpe":              round(sharpe, 3),
+        "by_worker":           sorted(by_w.values(), key=lambda x: -x["net_pnl"]),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════

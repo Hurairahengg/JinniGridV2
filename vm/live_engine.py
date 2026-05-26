@@ -578,7 +578,6 @@ def run(config, on_event, stop_event):
                         else: continue
                         vol = float(t["volume"])
                         streamer.process_tick(ts, price, vol)
-                        ticks_this_period += 1
 
                 engine.poll_position_status()
                 consecutive_errors = 0
