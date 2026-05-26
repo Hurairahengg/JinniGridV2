@@ -161,58 +161,189 @@ function chartBaseOpts(el) {
   };
 }
 
-// ═══ HOME ═══
+// ═══ HOME / MISSION CONTROL (revamped) ═══
 let equityChart = null, equitySeries = null;
+let equityRange = "all";  // all | 100 | 50 | 20
+let equityRaw = [];
+
 async function loadHome() {
-  const [workers, portfolio, equity] = await Promise.all([
-    api.get("/api/workers"), api.get("/api/portfolio"), api.get("/api/equity"),
+  const [workers, portfolio, equity, trades24] = await Promise.all([
+    api.get("/api/workers"),
+    api.get("/api/portfolio"),
+    api.get("/api/equity"),
+    api.get("/api/trades?status=closed&limit=200"),
   ]);
   state.workers = workers;
+  equityRaw = equity;
 
-  const pnlEl = $("#kpi-pnl").querySelector(".kpi-value");
-  pnlEl.textContent = fmt.money(portfolio.net_pnl);
-  pnlEl.classList.toggle("positive", portfolio.net_pnl > 0);
-  pnlEl.classList.toggle("negative", portfolio.net_pnl < 0);
-  $("#kpi-wr").querySelector(".kpi-value").textContent = fmt.pct(portfolio.win_rate);
-  $("#kpi-wl").textContent = `${portfolio.wins} W / ${portfolio.losses} L`;
+  // ─── KPI: pnl ───
+  const pnlEl = $("#kpi-pnl");
+  const pnlVal = pnlEl.querySelector(".kc-value");
+  pnlVal.textContent = fmt.money(portfolio.net_pnl);
+  pnlVal.classList.toggle("positive", portfolio.net_pnl > 0);
+  pnlVal.classList.toggle("negative", portfolio.net_pnl < 0);
+  $("#kpi-trades").textContent = `${portfolio.n_trades} trades`;
+  // mini spark gradient color
+  $("#kpi-pnl-spark").style.background =
+    portfolio.net_pnl >= 0
+      ? "linear-gradient(180deg, transparent, color-mix(in srgb, var(--success) 18%, transparent))"
+      : "linear-gradient(180deg, transparent, color-mix(in srgb, var(--danger) 18%, transparent))";
+
+  // ─── KPI: win rate ───
+  $("#kpi-wr").querySelector(".kc-value").textContent = fmt.pct(portfolio.win_rate);
+  $("#kpi-wl").textContent = `${portfolio.wins}W / ${portfolio.losses}L`;
+  $("#kpi-wr-bar").style.width = (portfolio.win_rate || 0) + "%";
+
+  // ─── KPI: fleet ───
   const running = workers.filter(w => w.state === "RUNNING").length;
-  $("#kpi-fleet").querySelector(".kpi-value").textContent = `${running} / ${workers.length}`;
-  const positions = workers.reduce((s,w) => s + (w.open_positions || 0), 0);
-  $("#kpi-positions").querySelector(".kpi-value").textContent = positions;
+  $("#kpi-fleet").querySelector(".kc-value").textContent = `${running} / ${workers.length}`;
+  $("#kpi-fleet-dots").innerHTML = workers.slice(0, 20).map(w =>
+    `<span class="kc-dot ${w.state}" title="${w.id} · ${w.state}"></span>`
+  ).join("");
 
+  // ─── KPI: positions ───
+  const positions = workers.reduce((s,w) => s + (w.open_positions || 0), 0);
+  $("#kpi-positions").querySelector(".kc-value").textContent = positions;
+  const openWorkers = workers.filter(w => (w.open_positions || 0) > 0).map(w => w.id);
+  $("#kpi-pos-mini").textContent = openWorkers.length
+    ? openWorkers.slice(0, 3).join(" · ") + (openWorkers.length > 3 ? ` +${openWorkers.length - 3}` : "")
+    : "—";
+
+  // ─── header quick stats ───
+  const today = todaysPnl(trades24);
+  const hdrToday = $("#hdr-today");
+  hdrToday.textContent = fmt.money(today);
+  hdrToday.classList.toggle("pos", today > 0);
+  hdrToday.classList.toggle("neg", today < 0);
+  $("#hdr-24h").textContent = trades24Count(trades24);
+
+  // ─── fleet pulse ───
   $("#fleet-pulse-sub").textContent = `${running} active · ${workers.length} total`;
   $("#fleet-pulse").innerHTML = workers.map(w => `
     <div class="pulse-card">
       <span class="pulse-state ${w.state}"></span>
       <div class="pulse-info">
         <div class="pulse-id">${w.id}</div>
-        <div class="pulse-meta">${w.state} · ${w.connected ? "🔗" : "—"} · ${w.broker || "—"}</div>
+        <div class="pulse-meta">${w.state} · ${w.broker || "no broker"}</div>
       </div>
       <div class="pulse-balance">${w.last_balance != null ? "$" + Number(w.last_balance).toFixed(0) : "—"}</div>
-    </div>`).join("") || `<div style="padding:20px;color:var(--text-3);font-size:12px">no workers registered</div>`;
+    </div>`).join("") ||
+    `<div style="padding:20px;color:var(--text-3);font-size:11px;text-align:center">no workers registered</div>`;
 
-  renderHomeEquity(equity);
+  // ─── movers ───
+  renderMovers(portfolio.by_worker || [], trades24);
+
+  // ─── equity curve ───
+  renderHomeEquity();
 }
 
-function renderHomeEquity(equity) {
+function todaysPnl(trades) {
+  const start = new Date(); start.setHours(0,0,0,0);
+  return trades
+    .filter(t => t.exit_time && new Date(t.exit_time) >= start)
+    .reduce((s,t) => s + (t.net_pnl || 0), 0);
+}
+function trades24Count(trades) {
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  return trades.filter(t => t.exit_time && new Date(t.exit_time).getTime() >= cutoff).length;
+}
+
+function renderMovers(byWorker, trades24) {
+  const el = $("#movers"); if (!el) return;
+
+  // top + bottom 3 by net pnl
+  const sorted = [...byWorker].sort((a,b) => b.net_pnl - a.net_pnl);
+  const top = sorted.slice(0, 3);
+  const bot = sorted.slice(-3).reverse();
+
+  // recent trades — top 5 by abs pnl in last 24h
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const recent = trades24
+    .filter(t => t.exit_time && new Date(t.exit_time).getTime() >= cutoff)
+    .sort((a,b) => Math.abs(b.net_pnl||0) - Math.abs(a.net_pnl||0))
+    .slice(0, 5);
+
+  const rowHtml = (rank, id, val) => `
+    <div class="mover-row">
+      <span class="m-rank">${rank}</span>
+      <span class="m-id">${id}</span>
+      <span class="m-pnl ${val >= 0 ? "pos" : "neg"}">${fmt.money(val)}</span>
+    </div>`;
+
+  let html = "";
+  if (top.length) {
+    html += `<div class="movers-section">▲ top workers</div>`;
+    html += top.map((w,i) => rowHtml(i+1, w.worker_id, w.net_pnl)).join("");
+  }
+  if (bot.length && bot[0].net_pnl < 0) {
+    html += `<div class="movers-section">▼ bottom workers</div>`;
+    html += bot.filter(w => w.net_pnl < 0).map((w,i) => rowHtml(i+1, w.worker_id, w.net_pnl)).join("");
+  }
+  if (recent.length) {
+    html += `<div class="movers-section">↯ biggest 24h</div>`;
+    html += recent.map((t,i) => rowHtml(i+1, `${t.worker_id} #${t.ticket||"?"}`, t.net_pnl||0)).join("");
+  }
+  el.innerHTML = html || `<div class="movers-empty">no movement yet</div>`;
+}
+
+function renderHomeEquity() {
   const el = $("#equity-chart"); if (!el) return;
+
   if (!equityChart) {
-    equityChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    equityChart = LightweightCharts.createChart(el, {
+      ...chartBaseOpts(el),
+      handleScroll: false,
+      handleScale: false,
+      timeScale: {
+        ...chartBaseOpts(el).timeScale,
+        rightOffset: 4, fixLeftEdge: true, fixRightEdge: true,
+        lockVisibleTimeRangeOnResize: true,
+      },
+    });
     equitySeries = equityChart.addAreaSeries({
       lineColor: cssVar("--accent"),
       topColor:  "color-mix(in srgb, " + cssVar("--accent") + " 35%, transparent)",
       bottomColor:"color-mix(in srgb, " + cssVar("--accent") + " 2%, transparent)",
       lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: true,
     });
-    new ResizeObserver(() => equityChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+    new ResizeObserver(() => {
+      equityChart.resize(el.clientWidth, el.clientHeight);
+      equityChart.timeScale().fitContent();
+    }).observe(el);
   }
-  const data = equity.map((e, i) => ({
-    time: Math.floor(new Date(e.ts || Date.now()).getTime() / 1000) + i,
-    value: e.cum,
-  }));
-  equitySeries.setData(data);
-  if (data.length) equityChart.timeScale().fitContent();
+
+  // slice by selected range
+  let data = equityRaw.slice();
+  if (equityRange !== "all") {
+    const n = parseInt(equityRange, 10);
+    data = data.slice(-n);
+  }
+
+  // use sequential integer "time" so it never drifts even if trade timestamps are weird
+  const points = data.map((e, i) => ({ time: i + 1, value: e.cum }));
+  equitySeries.setData(points);
+  equityChart.timeScale().fitContent();
+
+  // meta line
+  const last = points.length ? points[points.length - 1].value : 0;
+  const first = points.length ? points[0].value : 0;
+  const delta = last - first;
+  $("#equity-meta").innerHTML = points.length
+    ? `${points.length} trades · <span style="color:${delta >= 0 ? "var(--success)" : "var(--danger)"}">${fmt.money(delta)}</span> over range`
+    : "no closed trades yet";
 }
+
+// range selector
+document.addEventListener("click", e => {
+  if (!e.target.classList.contains("seg-btn")) return;
+  if (!e.target.closest(".eq-controls")) return;
+  $$(".eq-controls .seg-btn").forEach(b => b.classList.toggle("active", b === e.target));
+  equityRange = e.target.dataset.range;
+  renderHomeEquity();
+});
+
 
 // ═══ PORTFOLIO ═══
 let portEquityChart = null, portEquitySeries = null;

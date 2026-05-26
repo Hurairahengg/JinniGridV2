@@ -4,11 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Jinni Grid · Mission Control</title>
-  https://fonts.googleapis.com
-  https://fonts.gstatic.com
-  ;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  /web/style.css
-  /lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/web/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 
@@ -113,68 +113,103 @@
 <!-- CONTENT -->
 <main class="content">
 
-  <!-- HOME -->
+<!-- HOME -->
   <section class="page active" data-page="home">
-    <header class="page-header">
-      <div>
+    <header class="page-header tight">
+      <div class="ph-left">
         <h1 class="page-title">Mission Control</h1>
         <p class="page-sub">live infrastructure overview</p>
       </div>
-      <div class="page-actions">
+      <div class="ph-right">
+        <div class="quick-stat">
+          <span class="qs-label">today</span>
+          <span class="qs-value" id="hdr-today">—</span>
+        </div>
+        <div class="quick-stat">
+          <span class="qs-label">trades 24h</span>
+          <span class="qs-value" id="hdr-24h">0</span>
+        </div>
         <span class="pulse-label"><span class="pulse-dot"></span>live</span>
       </div>
     </header>
 
-    <div class="kpi-row">
-      <div class="kpi" id="kpi-pnl">
-        <div class="kpi-label">net pnl</div>
-        <div class="kpi-value">$0.00</div>
-        <div class="kpi-foot">all-time</div>
-        <div class="kpi-glow"></div>
+    <!-- KPI STRIP -->
+    <div class="kpi-strip">
+      <div class="kpi-cell" id="kpi-pnl">
+        <div class="kc-label">net pnl</div>
+        <div class="kc-row">
+          <div class="kc-value">$0.00</div>
+          <div class="kc-spark" id="kpi-pnl-spark"></div>
+        </div>
+        <div class="kc-foot">all-time · <span id="kpi-trades">0 trades</span></div>
       </div>
-      <div class="kpi" id="kpi-wr">
-        <div class="kpi-label">win rate</div>
-        <div class="kpi-value">0%</div>
-        <div class="kpi-foot"><span id="kpi-wl">0 / 0</span></div>
-        <div class="kpi-glow"></div>
+      <div class="kpi-cell" id="kpi-wr">
+        <div class="kc-label">win rate</div>
+        <div class="kc-row">
+          <div class="kc-value">0%</div>
+          <div class="kc-bar"><div class="kc-bar-fill" id="kpi-wr-bar"></div></div>
+        </div>
+        <div class="kc-foot"><span id="kpi-wl">0W / 0L</span></div>
       </div>
-      <div class="kpi" id="kpi-fleet">
-        <div class="kpi-label">fleet active</div>
-        <div class="kpi-value">0 / 0</div>
-        <div class="kpi-foot">running / total</div>
-        <div class="kpi-glow"></div>
+      <div class="kpi-cell" id="kpi-fleet">
+        <div class="kc-label">fleet</div>
+        <div class="kc-row">
+          <div class="kc-value">0 / 0</div>
+          <div class="kc-dots" id="kpi-fleet-dots"></div>
+        </div>
+        <div class="kc-foot">running / total</div>
       </div>
-      <div class="kpi" id="kpi-positions">
-        <div class="kpi-label">open positions</div>
-        <div class="kpi-value">0</div>
-        <div class="kpi-foot">across fleet</div>
-        <div class="kpi-glow"></div>
+      <div class="kpi-cell" id="kpi-positions">
+        <div class="kc-label">open positions</div>
+        <div class="kc-row">
+          <div class="kc-value">0</div>
+          <div class="kc-mini" id="kpi-pos-mini">—</div>
+        </div>
+        <div class="kc-foot">across fleet</div>
       </div>
     </div>
 
-    <div class="home-grid">
-      <div class="panel panel-equity">
-        <div class="panel-header">
-          <h3>Equity Curve</h3>
-          <span class="panel-sub">cumulative pnl · closed trades</span>
+    <!-- EQUITY (full width) -->
+    <div class="panel panel-equity-full">
+      <div class="panel-header">
+        <h3>Equity Curve</h3>
+        <div class="eq-controls">
+          <span class="panel-sub" id="equity-meta">—</span>
+          <div class="seg">
+            <button class="seg-btn active" data-range="all">all</button>
+            <button class="seg-btn" data-range="100">100</button>
+            <button class="seg-btn" data-range="50">50</button>
+            <button class="seg-btn" data-range="20">20</button>
+          </div>
         </div>
-        <div id="equity-chart" class="equity-chart"></div>
       </div>
+      <div id="equity-chart" class="equity-chart-full"></div>
+    </div>
 
-      <div class="panel panel-fleet-mini">
+    <!-- 3-COL BOTTOM GRID -->
+    <div class="home-bottom">
+      <div class="panel">
         <div class="panel-header">
-          <h3>Fleet Pulse</h3>
+          <h3>Fleet</h3>
           <span class="panel-sub" id="fleet-pulse-sub">—</span>
         </div>
         <div id="fleet-pulse" class="fleet-pulse"></div>
       </div>
 
-      <div class="panel panel-feed">
+      <div class="panel">
         <div class="panel-header">
-          <h3>Activity Feed</h3>
-          <span class="panel-sub">realtime events</span>
+          <h3>Activity</h3>
+          <span class="panel-sub">realtime feed</span>
         </div>
         <div id="activity-feed" class="activity-feed"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Movers</h3>
+          <span class="panel-sub">last 24h</span>
+        </div>
+        <div id="movers" class="movers"></div>
       </div>
     </div>
   </section>
@@ -356,6 +391,6 @@
 
 <div id="toast-stack" class="toast-stack"></div>
 
-/web/app.js
+<script src="/web/app.js"></script>
 </body>
 </html>
