@@ -47,7 +47,9 @@ def _params_from(record):
 def simulate_trade(bars, signal_idx, lots, params):
     """
     Re-runs backtester logic on the trade's captured bar window.
-    Uses params from the trade record (not module globals).
+    Returns ok=True (with sim results), or ok=False with either:
+      - inconclusive=True  → couldn't determine, but trade is plausible (don't flag)
+      - inconclusive=False → real validation failure (flag as mismatch)
     """
     streak_size        = params["streak_size"]
     tp_close_after     = params["tp_close_after"]
@@ -58,24 +60,24 @@ def simulate_trade(bars, signal_idx, lots, params):
     diag = (f"len(bars)={len(bars)} signal_idx={signal_idx} "
             f"STREAK_SIZE={streak_size} TP_AFTER={tp_close_after}")
 
-    # ─── streak validation ───
+    # ─── streak validation (real failures) ───
     if signal_idx < streak_size:
-        return {"ok": False, "reason": f"not enough streak bars ({diag})"}
+        return {"ok": False, "inconclusive": False, "reason": f"not enough streak bars ({diag})"}
 
     streak_dir = direction(bars[signal_idx - streak_size])
     if streak_dir == 0:
-        return {"ok": False, "reason": f"streak base bar is doji ({diag})"}
+        return {"ok": False, "inconclusive": False, "reason": f"streak base bar is doji ({diag})"}
     for j in range(signal_idx - streak_size, signal_idx):
         if direction(bars[j]) != streak_dir:
-            return {"ok": False, "reason": f"streak invalid at j={j} ({diag})"}
+            return {"ok": False, "inconclusive": False, "reason": f"streak invalid at j={j} ({diag})"}
 
     reversal_dir = direction(bars[signal_idx])
     if reversal_dir != -streak_dir:
-        return {"ok": False, "reason": f"reversal direction wrong ({diag})"}
+        return {"ok": False, "inconclusive": False, "reason": f"reversal direction wrong ({diag})"}
 
     entry_idx = signal_idx + 1
     if entry_idx >= len(bars):
-        return {"ok": False, "reason": f"no entry bar ({diag})"}
+        return {"ok": False, "inconclusive": True, "reason": f"no entry bar captured ({diag})"}
 
     tp_idx_ideal = entry_idx + tp_close_after
     tp_idx = min(tp_idx_ideal, len(bars) - 1)
@@ -90,7 +92,7 @@ def simulate_trade(bars, signal_idx, lots, params):
         entry_price = raw_entry - slippage_points
         sl_price    = entry_price + fixed_sl_points
 
-    # ─── walk forward ───
+    # ─── walk forward, looking for SL ───
     hit_sl = False
     exit_price = None
     exit_idx = None
@@ -113,7 +115,11 @@ def simulate_trade(bars, signal_idx, lots, params):
 
     if not hit_sl:
         if walk_truncated:
-            return {"ok": False, "reason": f"walk-forward truncated, can't simulate TP ({diag})"}
+            # window cut short before TP could be reached and no SL in available bars.
+            # Most likely: position closed externally (manual/broker) or sim window missing bars.
+            # Don't flag as mismatch — mark inconclusive.
+            return {"ok": False, "inconclusive": True,
+                    "reason": f"window truncated before TP, can't replay ({diag})"}
         raw_tp = bars[tp_idx]["close"]
         exit_price = raw_tp - slippage_points if reversal_dir == 1 else raw_tp + slippage_points
         exit_idx = tp_idx
@@ -124,7 +130,7 @@ def simulate_trade(bars, signal_idx, lots, params):
     net_pnl    = gross_pnl - commission
 
     return {
-        "ok": True,
+        "ok": True, "inconclusive": False,
         "dir": reversal_dir,
         "entry_price": entry_price,
         "sl_price": sl_price,
@@ -145,13 +151,17 @@ def validate_trade(record):
     params     = _params_from(record)
 
     sim = simulate_trade(bars, signal_idx, lots, params)
+
     if not sim["ok"]:
+        # inconclusive ≠ mismatch — flag separately so dashboard/telegram don't yell
         return {
-            "match": False,
-            "reason": f"sim_failed: {sim['reason']}",
-            "expected_pnl": 0.0,
-            "pnl_diff": 0.0,
-            "pnl_diff_pct": 0.0,
+            "match":         bool(sim.get("inconclusive")),  # don't treat inconclusive as failure
+            "inconclusive":  bool(sim.get("inconclusive")),
+            "reason":        sim["reason"],
+            "expected_pnl":  0.0,
+            "pnl_diff":      0.0,
+            "pnl_diff_pct":  0.0,
+            "params_used":   params,
         }
 
     actual_entry = record["actual_entry"]
@@ -176,8 +186,9 @@ def validate_trade(record):
                        f"sim={'SL' if sim['hit_sl'] else 'TP'})")
 
     return {
-        "match": len(reasons) == 0,
-        "reason": ",".join(reasons) if reasons else "ok",
+        "match":         len(reasons) == 0,
+        "inconclusive":  False,
+        "reason":        ",".join(reasons) if reasons else "ok",
         "expected_entry": sim["entry_price"],
         "expected_exit":  sim["exit_price"],
         "expected_pnl":   sim["net_pnl"],

@@ -147,6 +147,12 @@ class FleetManager:
             try:    telegram_bot.send_error(f"[{worker_id}] {payload.get('message','')}")
             except Exception: pass
             await self._broadcast_ui({"type": "error", "worker_id": worker_id, "payload": payload})
+        elif mtype == "warmup.done":
+            store.insert_event(worker_id, "warmup.done", "system", payload)
+            store.insert_log(worker_id, "INFO",
+                             f"warmup done: {payload.get('bars')} bars, "
+                             f"{payload.get('in_memory')} in memory")
+            await self._broadcast_ui({"type": "warmup.done", "worker_id": worker_id, "payload": payload})
 
         elif mtype == "position.resync":
             store.insert_event(worker_id, "position.resync", "system", payload)
