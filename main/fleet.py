@@ -1,0 +1,252 @@
+"""
+fleet.py — Fleet manager: live worker registry + event router + command dispatch.
+
+Owns the in-memory map of {worker_id -> WebSocket}. Routes incoming events to
+store + validator + telegram. Pushes commands out to workers. Watches heartbeats.
+"""
+
+import os
+import json
+import uuid
+import asyncio
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import store
+import validator        # YOUR existing file, untouched
+import telegram_bot     # YOUR existing file, untouched
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+PROTOCOL_VERSION  = 1
+HEARTBEAT_TIMEOUT = 25     # seconds before marking DEAD
+HEARTBEAT_TICK    = 5      # how often we sweep
+CONFIGS_DIR       = Path(__file__).parent / "configs"
+
+# Master secret used to validate worker tokens. Set in env in prod.
+MASTER_SECRET = os.environ.get("JINNI_MASTER_SECRET", "dev-secret-change-me")
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG FILES (per-VM JSON in main/configs/)
+# ═══════════════════════════════════════════════════════════════
+def config_path(worker_id):
+    return CONFIGS_DIR / f"{worker_id}.json"
+
+
+def load_config(worker_id):
+    p = config_path(worker_id)
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
+def save_config(worker_id, cfg):
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(config_path(worker_id), "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def list_configs():
+    if not CONFIGS_DIR.exists():
+        return []
+    return sorted([p.stem for p in CONFIGS_DIR.glob("*.json")])
+
+
+def validate_token(worker_id, token):
+    """Token check: config file has `auth_token` field. Compare verbatim.
+    (HMAC scheme is overkill for now; this is a closed fleet.)"""
+    cfg = load_config(worker_id)
+    if cfg is None:
+        return False
+    expected = cfg.get("auth_token")
+    return bool(expected) and token == expected
+
+
+# ═══════════════════════════════════════════════════════════════
+# FLEET MANAGER
+# ═══════════════════════════════════════════════════════════════
+class FleetManager:
+    def __init__(self):
+        self.workers = {}          # worker_id -> WebSocket
+        self.ui_clients = set()    # set of dashboard WebSockets
+
+    # ─── connection lifecycle ────────────────────────────────────
+    async def attach(self, worker_id, ws, hello_payload):
+        # disconnect any existing session for this id (last-write-wins)
+        if worker_id in self.workers:
+            old = self.workers[worker_id]
+            try:
+                await old.close(code=4000, reason="superseded")
+            except Exception:
+                pass
+
+        self.workers[worker_id] = ws
+        store.upsert_worker(
+            worker_id,
+            broker=hello_payload.get("broker"),
+            account=hello_payload.get("account"),
+            version=hello_payload.get("version"),
+            state="IDLE",
+        )
+        store.set_worker_state(worker_id, "IDLE")
+        store.insert_event(worker_id, "worker.connect", "system", hello_payload)
+        await self._broadcast_ui({"type": "worker.update", "worker_id": worker_id})
+        telegram_bot.send_status(f"🟢 Worker {worker_id} connected")
+
+    async def detach(self, worker_id):
+        self.workers.pop(worker_id, None)
+        store.set_worker_state(worker_id, "OFFLINE")
+        store.insert_event(worker_id, "worker.disconnect", "system")
+        await self._broadcast_ui({"type": "worker.update", "worker_id": worker_id})
+        telegram_bot.send_status(f"🔴 Worker {worker_id} disconnected")
+
+    # ─── inbound message routing ─────────────────────────────────
+    async def handle_message(self, worker_id, msg):
+        mtype   = msg.get("type")
+        payload = msg.get("payload", {}) or {}
+
+        if mtype == "heartbeat":
+            store.update_heartbeat(worker_id, payload)
+            await self._broadcast_ui({"type": "heartbeat", "worker_id": worker_id, "payload": payload})
+
+        elif mtype == "trade.opened":
+            store.insert_open_trade(worker_id, payload)
+            store.insert_event(worker_id, "trade.opened", "system",
+                               {"ticket": payload.get("ticket")})
+            try:
+                telegram_bot.send_signal(payload)
+            except Exception as e:
+                store.insert_log(worker_id, "ERROR", f"telegram send_signal failed: {e}")
+            await self._broadcast_ui({"type": "trade.opened", "worker_id": worker_id, "payload": payload})
+
+        elif mtype == "trade.closed":
+            # validate using YOUR existing validator.validate_trade
+            verdict = {"match": False, "reason": "no_window", "expected_pnl": 0.0,
+                       "pnl_diff": 0.0, "pnl_diff_pct": 0.0}
+            try:
+                if payload.get("bars_window") and payload.get("signal_idx_in_window") is not None:
+                    verdict = validator.validate_trade(payload)
+            except Exception as e:
+                verdict["reason"] = f"validator_exception: {e}"
+                store.insert_log(worker_id, "ERROR", f"validator failed: {e}")
+
+            store.close_trade(worker_id, payload, verdict)
+            store.insert_event(worker_id, "trade.closed", "system",
+                               {"ticket": payload.get("ticket"), "net_pnl": payload.get("net_pnl"),
+                                "match": verdict.get("match")})
+            try:
+                telegram_bot.send_close(payload, verdict)
+            except Exception as e:
+                store.insert_log(worker_id, "ERROR", f"telegram send_close failed: {e}")
+
+            await self._broadcast_ui({"type": "trade.closed", "worker_id": worker_id,
+                                      "payload": payload, "verdict": verdict})
+
+        elif mtype == "log":
+            store.insert_log(worker_id, payload.get("level", "INFO"),
+                             payload.get("message", ""), payload.get("context"))
+            await self._broadcast_ui({"type": "log", "worker_id": worker_id, "payload": payload})
+
+        elif mtype == "error":
+            store.insert_log(worker_id, "ERROR", payload.get("message", ""), payload.get("context"))
+            telegram_bot.send_error(f"[{worker_id}] {payload.get('message','')}")
+            await self._broadcast_ui({"type": "error", "worker_id": worker_id, "payload": payload})
+
+        elif mtype == "position.resync":
+            store.insert_event(worker_id, "position.resync", "system", payload)
+            await self._broadcast_ui({"type": "position.resync", "worker_id": worker_id, "payload": payload})
+
+        elif mtype == "ack":
+            pass  # message ack — no-op for now
+
+        else:
+            store.insert_log(worker_id, "WARN", f"unknown message type: {mtype}")
+
+    # ─── outbound commands ──────────────────────────────────────
+    async def send_command(self, worker_id, cmd_type, payload=None, actor="operator"):
+        ws = self.workers.get(worker_id)
+        if ws is None:
+            return False, "worker offline"
+        msg = _envelope(cmd_type, worker_id, payload or {})
+        try:
+            await ws.send_json(msg)
+        except Exception as e:
+            return False, f"send failed: {e}"
+        store.insert_event(worker_id, cmd_type, actor, payload or {})
+        return True, "ok"
+
+    async def push_config(self, worker_id, actor="operator"):
+        cfg = load_config(worker_id)
+        if cfg is None:
+            return False, "no config"
+        return await self.send_command(worker_id, "cmd.reload_config", {"config": cfg}, actor=actor)
+
+    async def hello_ack(self, worker_id, ws):
+        cfg = load_config(worker_id) or {}
+        await ws.send_json(_envelope("hello.ack", worker_id, {
+            "config": cfg,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+        }))
+
+    # ─── UI broadcast ───────────────────────────────────────────
+    def attach_ui(self, ws):
+        self.ui_clients.add(ws)
+
+    def detach_ui(self, ws):
+        self.ui_clients.discard(ws)
+
+    async def _broadcast_ui(self, msg):
+        dead = []
+        for ws in list(self.ui_clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.ui_clients.discard(ws)
+
+    # ─── background: heartbeat sweeper ──────────────────────────
+    async def heartbeat_loop(self):
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                for w in store.list_workers():
+                    if w["state"] in ("OFFLINE", "DEAD"):
+                        continue
+                    lh = w.get("last_heartbeat")
+                    if lh is None:
+                        continue
+                    last = datetime.fromisoformat(lh) if isinstance(lh, str) else lh
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if (now - last).total_seconds() > HEARTBEAT_TIMEOUT:
+                        store.set_worker_state(w["id"], "DEAD")
+                        store.insert_event(w["id"], "worker.dead", "system",
+                                           {"last_heartbeat": lh})
+                        telegram_bot.send_error(f"⚠️ Worker {w['id']} heartbeat lost")
+                        await self._broadcast_ui({"type": "worker.update", "worker_id": w["id"]})
+            except Exception as e:
+                store.insert_log(None, "ERROR", f"heartbeat_loop error: {e}")
+            await asyncio.sleep(HEARTBEAT_TICK)
+
+
+# ═══════════════════════════════════════════════════════════════
+# helpers
+# ═══════════════════════════════════════════════════════════════
+def _envelope(type_, worker_id, payload):
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": type_,
+        "worker_id": worker_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "msg_id": str(uuid.uuid4()),
+        "payload": payload,
+    }
+
+
+# singleton — imported by main.py
+fleet = FleetManager()

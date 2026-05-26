@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Jinni Grid — Mother</title>
+  <link rel="stylesheet" href="/web/style.css" />
+</head>
+<body>
+  <header>
+    <h1>🤖 JINNI GRID</h1>
+    <div id="conn-status" class="conn off">disconnected</div>
+  </header>
+
+  <nav>
+    <button class="tab active" data-tab="fleet">Fleet</button>
+    <button class="tab" data-tab="trades">Trades</button>
+    <button class="tab" data-tab="logs">Logs</button>
+    <button class="tab" data-tab="configs">Configs</button>
+  </nav>
+
+  <main>
+    <!-- ── FLEET ── -->
+    <section id="tab-fleet" class="tab-pane active">
+      <div class="portfolio">
+        <div class="stat"><label>Trades</label><span id="pf-n">–</span></div>
+        <div class="stat"><label>Net PnL</label><span id="pf-pnl">–</span></div>
+        <div class="stat"><label>Win Rate</label><span id="pf-wr">–</span></div>
+        <div class="stat"><label>W / L</label><span id="pf-wl">–</span></div>
+      </div>
+      <table id="fleet-table">
+        <thead><tr>
+          <th>ID</th><th>State</th><th>Broker</th><th>Account</th>
+          <th>Balance</th><th>Equity</th><th>Pos</th><th>Mem</th>
+          <th>Last HB</th><th>Actions</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- ── TRADES ── -->
+    <section id="tab-trades" class="tab-pane">
+      <div class="row">
+        <label>Worker: <input id="trade-filter-worker" placeholder="(all)" /></label>
+        <label>Status:
+          <select id="trade-filter-status"><option value="">all</option>
+            <option value="open">open</option><option value="closed">closed</option></select>
+        </label>
+        <button onclick="loadTrades()">Refresh</button>
+      </div>
+      <table id="trades-table">
+        <thead><tr>
+          <th>ID</th><th>Worker</th><th>Ticket</th><th>Symbol</th><th>Dir</th>
+          <th>Status</th><th>Entry</th><th>Exit</th><th>Lots</th>
+          <th>Net PnL</th><th>R</th><th>Match</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- ── LOGS ── -->
+    <section id="tab-logs" class="tab-pane">
+      <div class="row">
+        <label>Worker: <input id="log-filter-worker" placeholder="(all)" /></label>
+        <label>Level:
+          <select id="log-filter-level"><option value="">all</option>
+            <option>INFO</option><option>WARN</option><option>ERROR</option></select>
+        </label>
+        <button onclick="loadLogs()">Refresh</button>
+      </div>
+      <pre id="logs-out"></pre>
+    </section>
+
+    <!-- ── CONFIGS ── -->
+    <section id="tab-configs" class="tab-pane">
+      <div class="row">
+        <select id="config-select"></select>
+        <button onclick="loadConfig()">Load</button>
+        <button onclick="saveConfig()">Save &amp; Push</button>
+      </div>
+      <textarea id="config-editor" rows="28" spellcheck="false"></textarea>
+    </section>
+  </main>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

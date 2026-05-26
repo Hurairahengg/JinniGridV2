@@ -1,0 +1,51 @@
+* { box-sizing: border-box; }
+body { margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+       background:#0d1117; color:#c9d1d9; font-size:13px; }
+header { display:flex; align-items:center; gap:1rem; padding:.7rem 1rem;
+         border-bottom:1px solid #30363d; background:#161b22; }
+header h1 { margin:0; font-size:1rem; }
+.conn { padding:2px 8px; border-radius:3px; font-size:11px; }
+.conn.on  { background:#1f6f3f; color:#d4f5d4; }
+.conn.off { background:#6f1f1f; color:#f5d4d4; }
+
+nav { display:flex; gap:0; background:#161b22; border-bottom:1px solid #30363d; }
+nav .tab { background:none; border:none; color:#8b949e; padding:.6rem 1rem;
+           cursor:pointer; font-family:inherit; font-size:13px; }
+nav .tab.active { color:#fff; border-bottom:2px solid #58a6ff; }
+
+main { padding:1rem; }
+.tab-pane { display:none; }
+.tab-pane.active { display:block; }
+
+.row { display:flex; gap:.8rem; align-items:center; margin-bottom:.7rem; }
+input, select, textarea, button {
+  background:#0d1117; color:#c9d1d9; border:1px solid #30363d;
+  padding:.3rem .5rem; font-family:inherit; font-size:13px; border-radius:3px;
+}
+button { cursor:pointer; background:#21262d; }
+button:hover { background:#30363d; }
+textarea { width:100%; font-family:inherit; }
+
+.portfolio { display:flex; gap:1rem; margin-bottom:1rem; }
+.stat { background:#161b22; border:1px solid #30363d; border-radius:4px;
+        padding:.6rem 1rem; min-width:130px; }
+.stat label { display:block; color:#8b949e; font-size:11px; }
+.stat span  { font-size:1.2rem; font-weight:bold; }
+
+table { width:100%; border-collapse:collapse; }
+th, td { padding:.35rem .5rem; text-align:left; border-bottom:1px solid #21262d; }
+th { background:#161b22; color:#8b949e; font-weight:normal; font-size:11px;
+     text-transform:uppercase; }
+tr.win  td { color:#7ee787; }
+tr.loss td { color:#ff7b72; }
+
+.badge { padding:1px 6px; border-radius:3px; font-size:10px; font-weight:bold; }
+.badge.OFFLINE { background:#484f58; color:#fff; }
+.badge.IDLE    { background:#1f6feb; color:#fff; }
+.badge.RUNNING { background:#238636; color:#fff; }
+.badge.ERROR   { background:#da3633; color:#fff; }
+.badge.DEAD    { background:#6e040c; color:#fff; }
+
+.actions button { padding:1px 6px; font-size:11px; }
+#logs-out { background:#161b22; padding:.7rem; border-radius:4px;
+            max-height:65vh; overflow:auto; white-space:pre; }

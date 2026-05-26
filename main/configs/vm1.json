@@ -1,0 +1,33 @@
+{
+  "auth_token": "REPLACE_ME_WITH_RANDOM_64CHAR_STRING",
+  "auto_start": true,
+
+  "symbol": "USTEC",
+  "brick_size": 8.0,
+  "rev_bricks": 2.0,
+  "clean_mode": true,
+  "price_decimals": 2,
+  "max_bars_in_mem": 100,
+  "warmup_bars": 100,
+
+  "streak_size": 2,
+  "tp_close_after": 3,
+  "fixed_sl_points": 16.0,
+
+  "slippage_points": 0.3,
+  "commission_per_lot": 0.8,
+
+  "risk_per_100": 1.0,
+  "scaling_enabled": true,
+  "starting_balance": 3100.0,
+  "point_value_per_lot": 1.0,
+  "min_lots": 0.01,
+  "max_lots": 600.0,
+
+  "magic_number": 778899,
+  "order_comment": "JinniSnapback",
+  "deviation_points": 30,
+
+  "tick_poll_interval": 0.05,
+  "history_lookback_days": 14
+}
