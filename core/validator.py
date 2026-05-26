@@ -43,28 +43,34 @@ def simulate_trade(bars, signal_idx, lots):
       bars[signal_idx + 1]                          = entry bar
       bars[signal_idx + 1 .. signal_idx + 1 + TP_CLOSE_AFTER] = walk-forward
 
-    Returns dict with theoretical entry/exit/pnl, or {"ok": False, "reason": "..."}
-    matching the live trade. Uses identical math to your original backtest.
+    Tolerates partial walk-forward (e.g., SL hit before all TP bars elapsed).
     """
+    # ─── diagnostic ───
+    diag = f"len(bars)={len(bars)} signal_idx={signal_idx} STREAK_SIZE={STREAK_SIZE} TP_AFTER={TP_CLOSE_AFTER}"
+
     # ─── validate streak ───
-    if signal_idx - STREAK_SIZE < 0:
-        return {"ok": False, "reason": "not enough streak bars"}
+    if signal_idx < STREAK_SIZE:
+        return {"ok": False, "reason": f"not enough streak bars ({diag})"}
 
     streak_dir = direction(bars[signal_idx - STREAK_SIZE])
     if streak_dir == 0:
-        return {"ok": False, "reason": "streak base bar is doji"}
+        return {"ok": False, "reason": f"streak base bar is doji ({diag})"}
     for j in range(signal_idx - STREAK_SIZE, signal_idx):
         if direction(bars[j]) != streak_dir:
-            return {"ok": False, "reason": f"streak invalid at j={j}"}
+            return {"ok": False, "reason": f"streak invalid at j={j} ({diag})"}
 
     reversal_dir = direction(bars[signal_idx])
     if reversal_dir != -streak_dir:
-        return {"ok": False, "reason": "reversal direction wrong"}
+        return {"ok": False, "reason": f"reversal direction wrong ({diag})"}
 
     entry_idx = signal_idx + 1
-    tp_idx    = entry_idx + TP_CLOSE_AFTER
-    if tp_idx >= len(bars):
-        return {"ok": False, "reason": "not enough walk-forward bars"}
+    if entry_idx >= len(bars):
+        return {"ok": False, "reason": f"no entry bar ({diag})"}
+
+    # tp_idx might exceed available walk-forward bars if SL hit early — that's fine, we cap it
+    tp_idx_ideal = entry_idx + TP_CLOSE_AFTER
+    tp_idx = min(tp_idx_ideal, len(bars) - 1)
+    walk_truncated = tp_idx < tp_idx_ideal
 
     # ─── entry ───
     raw_entry = bars[entry_idx]["open"]
@@ -97,6 +103,10 @@ def simulate_trade(bars, signal_idx, lots):
                 hit_sl = True; exit_idx = k; break
 
     if not hit_sl:
+        if walk_truncated:
+            # walk-forward was cut short (live SL fired before full window).
+            # Can't simulate a TP exit — mark as inconclusive.
+            return {"ok": False, "reason": f"walk-forward truncated, can't simulate TP ({diag})"}
         raw_tp = bars[tp_idx]["close"]
         exit_price = raw_tp - SLIPPAGE_POINTS if reversal_dir == 1 else raw_tp + SLIPPAGE_POINTS
         exit_idx = tp_idx

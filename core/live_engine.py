@@ -271,12 +271,13 @@ class StrategyEngine:
 
         if self.state == self.STATE_IN_TRADE:
             self.bars_since_entry += 1
+            # NEW: append this bar to the trade's window in real-time
+            if self.open_trade is not None:
+                self.open_trade["bars_window"].append(bar)
             # exit on TP if we've held through (TP_CLOSE_AFTER + 1) bars
-            # (entry bar counted as bar 1 once it emits)
             if self.bars_since_entry >= TP_CLOSE_AFTER + 1:
                 self._close_trade_tp(bar)
                 return
-            # otherwise just continue holding (SL is enforced by MT5 broker-side)
             return
 
         # IDLE — only allow signals once we have enough LIVE bars (no warmup contamination)
@@ -461,15 +462,14 @@ class StrategyEngine:
         commission = t["lots"] * COMMISSION_PER_LOT
         net_pnl    = gross_pnl - commission
 
-        # append walk-forward bars to validator window
-        # we stored the streak+signal already; now grab last bars from streamer that correspond
-        # to the entry bar through the exit bar.
-        all_bars = list(self.streamer.bars)
-        # the walk-forward bars are the last `bars_since_entry` emitted bars
-        n_walk = self.bars_since_entry  # this many bars emitted since entry
-        if n_walk > 0:
-            walk_forward = all_bars[-n_walk:]
-            t["bars_window"].extend(walk_forward)
+        # bars_window has been collected live during the trade (see on_bar).
+        # Sanity check it:
+        expected_total = (STREAK_SIZE + 1) + self.bars_since_entry
+        actual_total   = len(t["bars_window"])
+        if actual_total != expected_total:
+            print(f"[validator] ⚠️ bars_window size mismatch: "
+                  f"expected={expected_total} actual={actual_total} "
+                  f"bars_since_entry={self.bars_since_entry}")
 
         t.update({
             "status":      "closed",
