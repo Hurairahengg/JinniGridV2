@@ -1,14 +1,13 @@
 """
 live_engine.py — Worker-side strategy engine.
 
-Same strategy as core/live_engine.py. The only changes are at the EDGES:
-  • config comes in as a dict (not module globals)
-  • every telegram/validator/log emission goes through on_event(type, payload)
-  • exposes run(config, on_event, stop_event) for the worker runtime
-  • exposes a thread-safe get_status() snapshot for heartbeats
-
 Strategy state machine, bar generation, signal detection, order routing,
 SL/TP exit, and trade-record shape are BIT-IDENTICAL to the original.
+
+Edges:
+  • config dict in via run(config, on_event, stop_event)
+  • every state change goes through on_event(type, payload)
+  • verbose logging at every step so you can see exactly what's happening live
 """
 
 import math
@@ -21,7 +20,7 @@ import MetaTrader5 as mt5
 
 
 # ═════════════════════════════════════════════════════════════════
-# LIVE KOKO BAR STREAMER  (identical logic to core/live_engine.py)
+# LIVE KOKO BAR STREAMER  (logic unchanged)
 # ═════════════════════════════════════════════════════════════════
 class LiveKokoCandleStreamer:
     def __init__(self, range_size, rev_bricks, clean_mode, price_decimals,
@@ -137,7 +136,7 @@ class LiveKokoCandleStreamer:
 
 
 # ═════════════════════════════════════════════════════════════════
-# STRATEGY ENGINE  (logic unchanged, edges rewired to on_event)
+# STRATEGY ENGINE
 # ═════════════════════════════════════════════════════════════════
 def direction(c):
     if c["close"] > c["open"]: return 1
@@ -153,13 +152,11 @@ class StrategyEngine:
         self.streamer = streamer
         self.cfg = config
         self.on_event = on_event
-
         self.state = self.STATE_IDLE
         self.open_trade = None
         self.bars_since_entry = 0
         self.live_bars_seen = 0
 
-    # ─── helpers ────────────────────────────────────────────────
     def _log(self, level, msg):
         self.on_event("log", {"level": level, "message": msg})
 
@@ -179,24 +176,32 @@ class StrategyEngine:
             balance = c["starting_balance"]
         return (balance / 100.0) * c["risk_per_100"], balance
 
-    # ─── streamer callback ──────────────────────────────────────
     def on_bar(self, bar, global_idx, is_warmup):
         if is_warmup:
             return
         self.live_bars_seen += 1
 
+        # log every live bar emitted
+        self._log("INFO", f"new bar #{self.live_bars_seen} "
+                          f"O={bar['open']} H={bar['high']} L={bar['low']} C={bar['close']} "
+                          f"dir={direction(bar):+d}")
+
         if self.state == self.STATE_IN_TRADE:
             self.bars_since_entry += 1
             if self.open_trade is not None:
                 self.open_trade["bars_window"].append(bar)
+            self._log("INFO", f"IN_TRADE -- bars_since_entry={self.bars_since_entry}/"
+                              f"{self.cfg['tp_close_after'] + 1}")
             if self.bars_since_entry >= self.cfg["tp_close_after"] + 1:
+                self._log("INFO", "TP bar reached -- closing trade")
                 self._close_trade_tp(bar)
                 return
             return
 
         required_live_bars = self.cfg["streak_size"] + 1
         if self.live_bars_seen < required_live_bars:
-            self._log("INFO", f"bar #{self.live_bars_seen}/{required_live_bars} — building live history")
+            self._log("INFO", f"building live history {self.live_bars_seen}/{required_live_bars} "
+                              f"-- no signals yet")
             return
 
         self._check_signal()
@@ -209,15 +214,21 @@ class StrategyEngine:
         signal_bar   = bars[-1]
         reversal_dir = direction(signal_bar)
         if reversal_dir == 0:
+            self._log("INFO", "signal check: latest bar is doji -- skip")
             return
         streak_dir   = -reversal_dir
         streak_slice = bars[-(streak + 1):-1]
+        streak_dirs  = [direction(b) for b in streak_slice]
+
         for b in streak_slice:
             if direction(b) != streak_dir:
+                self._log("INFO", f"signal check: streak broken (need {streak} x dir={streak_dir:+d}, "
+                                  f"got {streak_dirs})")
                 return
+
+        self._log("INFO", f"SIGNAL -- streak={streak_dirs} reversal={reversal_dir:+d} -- firing order")
         self._open_trade(reversal_dir, bars, streak_slice, signal_bar)
 
-    # ─── order execution ────────────────────────────────────────
     def _open_trade(self, reversal_dir, bars_snapshot, streak_slice, signal_bar):
         c = self.cfg
         theo_entry = self.streamer.level
@@ -251,6 +262,9 @@ class StrategyEngine:
         else:
             live_sl = round(price + c["fixed_sl_points"], c["price_decimals"])
 
+        self._log("INFO", f"order_send -- dir={reversal_dir:+d} price={price} sl={live_sl} "
+                          f"lots={lots} risk=${risk:.2f} balance=${balance_used:.2f}")
+
         request = {
             "action":       mt5.TRADE_ACTION_DEAL,
             "symbol":       c["symbol"],
@@ -267,7 +281,7 @@ class StrategyEngine:
         result = mt5.order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             err = result.comment if result else mt5.last_error()
-            self._err(f"order_send failed: {err}")
+            self._err(f"order_send FAILED: retcode={getattr(result,'retcode',None)} err={err}")
             return
 
         actual_entry = result.price
@@ -302,7 +316,8 @@ class StrategyEngine:
         self.bars_since_entry = 0
         self.state = self.STATE_IN_TRADE
         self.on_event("trade.opened", trade)
-        self._log("INFO", f"OPEN ticket={ticket} dir={reversal_dir} entry={actual_entry} sl={live_sl} lots={lots}")
+        self._log("INFO", f"OPEN ticket={ticket} dir={reversal_dir:+d} entry={actual_entry} "
+                          f"sl={live_sl} lots={lots}")
 
     def _close_trade_tp(self, exit_bar):
         if self.open_trade is None:
@@ -311,6 +326,7 @@ class StrategyEngine:
         ticket = self.open_trade["ticket"]
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
+            self._log("INFO", f"position {ticket} not found -- assuming SL already hit, reconciling")
             self._reconcile_closed_position(ticket, exit_bar)
             return
 
@@ -336,16 +352,14 @@ class StrategyEngine:
         result = mt5.order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             err = result.comment if result else mt5.last_error()
-            self._err(f"TP close failed: {err}")
-            return
+            self._err(f"TP close FAILED: {err}"); return
         self._finalize_trade(exit_bar, result.price, hit_sl=False)
 
     def _reconcile_closed_position(self, ticket, exit_bar):
         from_time = datetime.now(timezone.utc) - timedelta(hours=24)
         deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
         if not deals:
-            self._err(f"could not find closing deal for ticket {ticket}")
-            return
+            self._err(f"could not find closing deal for ticket {ticket}"); return
         close_deal = max(deals, key=lambda d: d.time)
         self._finalize_trade(exit_bar, close_deal.price, hit_sl=True)
 
@@ -378,7 +392,8 @@ class StrategyEngine:
         })
 
         self.on_event("trade.closed", t)
-        self._log("INFO", f"CLOSE ticket={t['ticket']} pnl=${net_pnl:+.2f} reason={'SL' if hit_sl else 'TP'}")
+        self._log("INFO", f"CLOSE ticket={t['ticket']} pnl=${net_pnl:+.2f} "
+                          f"reason={'SL' if hit_sl else 'TP'} bars_held={self.bars_since_entry}")
 
         self.open_trade = None
         self.state = self.STATE_IDLE
@@ -391,9 +406,9 @@ class StrategyEngine:
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
             last_bar = self.streamer.bars[-1] if self.streamer.bars else None
+            self._log("INFO", f"broker-side SL detected on ticket {ticket} -- reconciling")
             self._reconcile_closed_position(ticket, last_bar)
 
-    # ─── status snapshot for heartbeats (thread-safe-ish read) ──
     def status_snapshot(self):
         return {
             "engine_state":     self.state,
@@ -406,20 +421,29 @@ class StrategyEngine:
 
 
 # ═════════════════════════════════════════════════════════════════
-# WARMUP
+# WARMUP (verbose)
 # ═════════════════════════════════════════════════════════════════
 def warmup(streamer, config, on_event):
+    def _log(level, msg): on_event("log", {"level": level, "message": msg})
+    def _err(msg):        on_event("error", {"message": msg})
+
     c = config
-    on_event("log", {"level": "INFO", "message": f"warmup: fetching ticks for {c['symbol']}…"})
+    _log("INFO", f"WARMUP start -- fetching ticks for {c['symbol']} "
+                 f"(lookback={c['history_lookback_days']} days)")
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=c["history_lookback_days"])
+
     ticks = mt5.copy_ticks_range(c["symbol"], start, end, mt5.COPY_TICKS_ALL)
     if ticks is None or len(ticks) == 0:
-        on_event("error", {"message": "warmup: no ticks from copy_ticks_range"})
+        _err(f"WARMUP FAILED: no ticks returned. mt5_error={mt5.last_error()}")
         return False
 
-    on_event("log", {"level": "INFO", "message": f"warmup: got {len(ticks):,} ticks, building bars…"})
+    _log("INFO", f"WARMUP got {len(ticks):,} ticks -- building bars...")
+
     last_ts = None
+    processed = 0
+    next_report = 50_000
+    last_report_time = time.time()
     for t in ticks:
         ts = int(t["time"])
         bid = float(t["bid"]); ask = float(t["ask"]); last = float(t["last"])
@@ -432,38 +456,70 @@ def warmup(streamer, config, on_event):
         if last_ts is not None and ts < last_ts: ts = last_ts
         last_ts = ts
         streamer.process_tick(ts, price, vol)
+        processed += 1
+
+        # progress report every 50k ticks OR every 3 seconds
+        if processed >= next_report or (time.time() - last_report_time) > 3:
+            _log("INFO", f"WARMUP progress -- ticks={processed:,}/{len(ticks):,} "
+                         f"bars_built={streamer.global_bar_count}")
+            next_report = processed + 50_000
+            last_report_time = time.time()
+
         if streamer.global_bar_count >= c["warmup_bars"] and len(streamer.bars) >= c["max_bars_in_mem"]:
+            _log("INFO", f"WARMUP early-exit -- enough bars built")
             break
 
-    on_event("log", {"level": "INFO",
-                     "message": f"warmup done: {streamer.global_bar_count} bars built, "
-                                f"{len(streamer.bars)} in memory"})
+    _log("INFO", f"WARMUP done -- {streamer.global_bar_count} bars built, "
+                 f"{len(streamer.bars)} in memory, {processed:,} ticks processed")
     return True
 
 
 # ═════════════════════════════════════════════════════════════════
-# RUN — entrypoint called by worker runtime (in its own thread)
+# RUN — worker calls this in a thread
 # ═════════════════════════════════════════════════════════════════
 def run(config, on_event, stop_event):
-    """
-    Blocks until stop_event is set or an unrecoverable error occurs.
-    on_event(type, payload) is thread-safe (it pushes onto worker's queue).
-    Returns "engine_handle" via on_event("engine.ready", {...}) so the
-    runtime can call status_snapshot/poll for heartbeats.
-    """
+    def _log(level, msg): on_event("log", {"level": level, "message": msg})
+    def _err(msg, ctx=None): on_event("error", {"message": msg, "context": ctx or {}})
+
     c = config
+    _log("INFO", f"engine.run() -- symbol={c['symbol']} brick={c['brick_size']} "
+                 f"streak={c['streak_size']} sl={c['fixed_sl_points']}")
 
     # ─── MT5 init ──────────────────────────────────────────────
+    _log("INFO", "MT5: initialize()...")
     if not mt5.initialize():
-        on_event("error", {"message": f"mt5.initialize() failed: {mt5.last_error()}"})
-        return
+        _err(f"mt5.initialize() FAILED: {mt5.last_error()}"); return
+
+    term = mt5.terminal_info()
+    if term:
+        _log("INFO", f"MT5 terminal: name={term.name} build={term.build} "
+                     f"connected={term.connected} trade_allowed={term.trade_allowed}")
+    else:
+        _log("WARN", "MT5 terminal_info() returned None")
+
+    acct = mt5.account_info()
+    if acct:
+        _log("INFO", f"MT5 account: login={acct.login} company={acct.company} "
+                     f"balance=${acct.balance:.2f} equity=${acct.equity:.2f} "
+                     f"currency={acct.currency} leverage={acct.leverage} "
+                     f"trade_allowed={acct.trade_allowed}")
+        if not acct.trade_allowed:
+            _err("ACCOUNT trade_allowed=False -- algo trading is disabled in MT5 terminal!")
+    else:
+        _err(f"mt5.account_info() returned None -- {mt5.last_error()}")
+
+    _log("INFO", f"MT5: selecting symbol {c['symbol']}...")
     if not mt5.symbol_select(c["symbol"], True):
-        on_event("error", {"message": f"symbol_select({c['symbol']}) failed"})
+        _err(f"symbol_select({c['symbol']}) FAILED: {mt5.last_error()}")
         mt5.shutdown(); return
+
     info = mt5.symbol_info(c["symbol"])
     if info is None:
-        on_event("error", {"message": f"symbol_info({c['symbol']}) None"})
-        mt5.shutdown(); return
+        _err(f"symbol_info({c['symbol']}) returned None"); mt5.shutdown(); return
+    _log("INFO", f"symbol {c['symbol']}: visible={info.visible} bid={info.bid} ask={info.ask} "
+                 f"point={info.point} digits={info.digits} "
+                 f"volume_min={info.volume_min} volume_step={info.volume_step} "
+                 f"trade_mode={info.trade_mode}")
 
     # ─── build streamer + engine ───────────────────────────────
     is_warmup = [True]
@@ -477,26 +533,27 @@ def run(config, on_event, stop_event):
     engine = StrategyEngine(streamer, c, on_event)
     streamer.on_bar_emit = lambda bar, gidx: engine.on_bar(bar, gidx, is_warmup=is_warmup[0])
 
-    # publish engine handle so runtime can read status for heartbeats
     on_event("engine.ready", {"engine": engine})
 
-    # ─── warmup ───────────────────────────────────────────────
-    on_event("log", {"level": "INFO", "message": "engine starting warmup"})
     if stop_event.is_set():
-        mt5.shutdown(); return
+        _log("INFO", "stop_event already set, skipping warmup"); mt5.shutdown(); return
     if not warmup(streamer, c, on_event):
-        on_event("error", {"message": "warmup failed, engine exiting"})
-        mt5.shutdown(); return
+        _err("warmup failed, engine exiting"); mt5.shutdown(); return
     is_warmup[0] = False
     on_event("warmup.done", {"bars": streamer.global_bar_count, "in_memory": len(streamer.bars)})
 
     # ─── live loop ────────────────────────────────────────────
-    try:
-        last_tick = mt5.symbol_info_tick(c["symbol"])
-        last_tick_ts = last_tick.time_msc if last_tick else 0
-        on_event("log", {"level": "INFO", "message": f"live loop entering. last_tick_msc={last_tick_ts}"})
+    last_tick = mt5.symbol_info_tick(c["symbol"])
+    last_tick_ts = last_tick.time_msc if last_tick else 0
+    _log("INFO", f"LIVE LOOP entering -- last_tick_msc={last_tick_ts} "
+                 f"poll_interval={c['tick_poll_interval']}s")
 
-        consecutive_errors = 0
+    consecutive_errors = 0
+    ticks_this_period = 0
+    period_start = time.time()
+    last_diag = time.time()
+
+    try:
         while not stop_event.is_set():
             try:
                 from_ts = last_tick_ts + 1
@@ -519,35 +576,46 @@ def run(config, on_event, stop_event):
                         else: continue
                         vol = float(t["volume"])
                         streamer.process_tick(ts, price, vol)
+                        ticks_this_period += 1
 
                 engine.poll_position_status()
                 consecutive_errors = 0
+
+                # periodic diagnostic every 30s
+                now = time.time()
+                if now - last_diag > 30:
+                    last_tick_info = mt5.symbol_info_tick(c["symbol"])
+                    tps = ticks_this_period / max(now - period_start, 0.001)
+                    _log("INFO", f"LIVE diag -- ticks_30s={ticks_this_period} "
+                                 f"({tps:.1f}/s) bars={len(streamer.bars)} "
+                                 f"engine={engine.state} live_bars={engine.live_bars_seen} "
+                                 f"bid={last_tick_info.bid if last_tick_info else 'n/a'} "
+                                 f"ask={last_tick_info.ask if last_tick_info else 'n/a'}")
+                    ticks_this_period = 0
+                    period_start = now
+                    last_diag = now
+
             except Exception as e:
                 consecutive_errors += 1
-                on_event("error", {"message": f"loop error: {e}",
-                                   "context": {"consecutive": consecutive_errors}})
+                _err(f"live loop error: {e}", ctx={"consecutive": consecutive_errors})
                 if consecutive_errors > 20:
-                    on_event("error", {"message": "too many consecutive loop errors, attempting MT5 reconnect"})
+                    _err("too many consecutive errors, attempting MT5 reconnect")
                     try:
-                        mt5.shutdown()
-                        time.sleep(2)
-                        mt5.initialize()
-                        mt5.symbol_select(c["symbol"], True)
+                        mt5.shutdown(); time.sleep(2)
+                        mt5.initialize(); mt5.symbol_select(c["symbol"], True)
                         consecutive_errors = 0
                     except Exception as ee:
-                        on_event("error", {"message": f"MT5 reconnect failed: {ee}"})
-                        time.sleep(5)
+                        _err(f"MT5 reconnect failed: {ee}"); time.sleep(5)
             time.sleep(c["tick_poll_interval"])
     finally:
-        on_event("log", {"level": "INFO", "message": "engine shutting down"})
+        _log("INFO", "engine shutting down, calling mt5.shutdown()")
         mt5.shutdown()
 
 
 # ═════════════════════════════════════════════════════════════════
-# ACCOUNT INFO helper (used by worker heartbeat)
+# ACCOUNT SNAPSHOT for heartbeats
 # ═════════════════════════════════════════════════════════════════
 def get_account_snapshot():
-    """Safe to call from runtime thread between strategy iterations."""
     try:
         acct = mt5.account_info()
         if acct is None:

@@ -3,7 +3,7 @@ main.py — VM Worker runtime.
 
 config.json fields:
   worker_id   — string, must match a file in mother/configs/<worker_id>.json
-  mother_url  — base URL, e.g. "http://192.168.3.232:5000"  (scheme converted automatically)
+  mother_url  — base URL, e.g. "http://192.168.3.232:5000"
   auto_start  — bool
   fallback_config — optional strategy dict used if Mother is offline at boot
 
@@ -20,6 +20,7 @@ import logging.handlers
 import threading
 import queue
 import uuid
+import platform
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,14 @@ from urllib.parse import urlparse, urlunparse
 import websockets
 
 import live_engine
+
+
+# ─── force UTF-8 stdout on Windows (kills the cp1252 crash) ───────
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 CONFIG_FILE        = Path(__file__).parent / "config.json"
@@ -40,26 +49,24 @@ WS_PING_TIMEOUT    = 20
 MAX_BUFFER         = 1000
 
 
-# ─── local logger ─────────────────────────────────────────────────
+# ─── local logger (UTF-8 everywhere) ─────────────────────────────
 def setup_local_logger():
     log = logging.getLogger("worker")
+    log.handlers.clear()
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
     fh.setFormatter(fmt)
-    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
     log.addHandler(fh); log.addHandler(sh)
     log.propagate = False
     return log
 
 
-# ─── URL builder: turn mother_url base into a clean ws:// or wss:// URL ─
 def build_ws_url(mother_url):
-    """
-    Accepts:   http://host:5000   https://host:5000   ws://host:5000   wss://host:5000
-               (with or without trailing slash, with or without /ws path)
-    Returns:   ws://host:5000/ws  or  wss://host:5000/ws
-    """
     u = urlparse(mother_url.strip().rstrip("/"))
     scheme_map = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}
     scheme = scheme_map.get(u.scheme.lower())
@@ -81,7 +88,15 @@ class Worker:
         self.fallback_cfg  = local_cfg.get("fallback_config", {})
 
         self.log = setup_local_logger()
-        self.log.info(f"worker_id={self.worker_id}  ws_url={self.ws_url}")
+        self.log.info("=" * 60)
+        self.log.info(f"JINNI WORKER booting")
+        self.log.info(f"  worker_id      = {self.worker_id}")
+        self.log.info(f"  ws_url         = {self.ws_url}")
+        self.log.info(f"  auto_start     = {self.auto_start}")
+        self.log.info(f"  python         = {platform.python_version()}")
+        self.log.info(f"  os             = {platform.system()} {platform.release()}")
+        self.log.info(f"  fallback_cfg   = {'YES' if self.fallback_cfg else 'NO'}")
+        self.log.info("=" * 60)
 
         self.active_config   = None
         self.strategy_thread = None
@@ -94,61 +109,101 @@ class Worker:
         self.shutdown_evt    = None
         self.version         = "0.1.0"
 
-    # ─── event callback (called from strategy thread) ───────────
+    # ─── unified logging: local file/stdout AND ship to Mother ──
+    def _log(self, level, msg, ctx=None):
+        getattr(self.log, level.lower(), self.log.info)(msg)
+        try:
+            self.event_q.put_nowait({
+                "type": "log",
+                "payload": {"level": level.upper(), "message": msg, "context": ctx or {}}
+            })
+        except queue.Full:
+            pass
+
+    def _err(self, msg, ctx=None):
+        self.log.error(msg)
+        try:
+            self.event_q.put_nowait({
+                "type": "error",
+                "payload": {"message": msg, "context": ctx or {}}
+            })
+        except queue.Full:
+            pass
+
+    # ─── event callback from strategy thread ────────────────────
     def on_event(self, type_, payload):
         if type_ == "engine.ready":
-            self.engine_ref = payload.get("engine"); return
+            self.engine_ref = payload.get("engine")
+            self._log("INFO", "engine.ready -- handle published, heartbeats now live")
+            return
+        if type_ == "warmup.done":
+            self._log("INFO", f"warmup.done -- bars={payload.get('bars')} in_memory={payload.get('in_memory')}")
         try:
             self.event_q.put_nowait({"type": type_, "payload": payload})
         except queue.Full:
             pass
 
-    # ─── strategy thread lifecycle ──────────────────────────────
+    # ─── strategy lifecycle ─────────────────────────────────────
     def start_strategy(self):
         if self.strategy_thread and self.strategy_thread.is_alive():
-            self.log.warning("start_strategy: already running"); return False
+            self._log("WARN", "start_strategy: already running")
+            return False
         if self.active_config is None:
-            self.log.error("start_strategy: no active config"); return False
+            self._err("start_strategy: no active config (Mother hasn't sent one and no fallback)")
+            return False
+
+        cfg = self.active_config
+        self._log("INFO", f"start_strategy -- symbol={cfg.get('symbol')} "
+                          f"brick={cfg.get('brick_size')} streak={cfg.get('streak_size')} "
+                          f"sl={cfg.get('fixed_sl_points')} tp_after={cfg.get('tp_close_after')}")
 
         self.strategy_stop.clear()
-        self.engine_state = "STARTING"; self.engine_ref = None
+        self.engine_state = "STARTING"
+        self.engine_ref = None
 
         def _runner():
             try:
+                self._log("INFO", "strategy thread: entering live_engine.run()")
                 live_engine.run(self.active_config, self.on_event, self.strategy_stop)
                 self.engine_state = "STOPPED"
-                self.on_event("log", {"level": "INFO", "message": "strategy thread exited cleanly"})
+                self._log("INFO", "strategy thread: live_engine.run() returned cleanly")
             except Exception as e:
                 self.engine_state = "ERROR"
-                self.on_event("error", {"message": f"strategy thread crashed: {e}"})
+                self._err(f"strategy thread CRASHED: {e}", ctx={"exception": str(e)})
 
         self.strategy_thread = threading.Thread(target=_runner, daemon=True, name="strategy")
         self.strategy_thread.start()
         self.engine_state = "RUNNING"
-        self.log.info("strategy thread started")
+        self._log("INFO", "strategy thread launched")
         return True
 
     def stop_strategy(self, timeout=15):
         if not self.strategy_thread or not self.strategy_thread.is_alive():
-            self.engine_state = "STOPPED"; return True
-        self.log.info("stopping strategy thread…")
+            self.engine_state = "STOPPED"
+            return True
+        self._log("INFO", f"stop_strategy -- signaling thread to stop (timeout={timeout}s)")
         self.strategy_stop.set()
         self.strategy_thread.join(timeout=timeout)
         if self.strategy_thread.is_alive():
-            self.log.error("strategy thread did NOT stop within timeout — left as daemon")
+            self._err("strategy thread did NOT stop within timeout -- leaving as daemon")
             return False
-        self.engine_state = "STOPPED"; self.engine_ref = None
+        self.engine_state = "STOPPED"
+        self.engine_ref = None
+        self._log("INFO", "strategy thread stopped")
         return True
 
     def restart_strategy(self):
-        self.stop_strategy(); time.sleep(1); return self.start_strategy()
+        self._log("INFO", "restart_strategy -- stopping then starting")
+        self.stop_strategy()
+        time.sleep(1)
+        return self.start_strategy()
 
-    # ─── ws supervisor (reconnect forever) ──────────────────────
+    # ─── ws supervisor ──────────────────────────────────────────
     async def ws_supervisor(self):
         backoff_i = 0
         while not self.shutdown_evt.is_set():
             try:
-                self.log.info(f"connecting to {self.ws_url}…")
+                self._log("INFO", f"connecting to {self.ws_url}...")
                 async with websockets.connect(
                     self.ws_url,
                     ping_interval=WS_PING_INTERVAL,
@@ -162,18 +217,19 @@ class Worker:
             except Exception as e:
                 self.log.warning(f"ws connect/loop error: {e}")
 
-            if self.shutdown_evt.is_set(): break
+            if self.shutdown_evt.is_set():
+                break
             delay = RECONNECT_BACKOFF[min(backoff_i, len(RECONNECT_BACKOFF) - 1)]
             backoff_i += 1
-            self.log.info(f"reconnecting in {delay}s (attempt #{backoff_i})…")
+            self.log.info(f"reconnecting in {delay}s (attempt #{backoff_i})...")
             try:
                 await asyncio.wait_for(self.shutdown_evt.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 
     async def _session(self, ws):
-        # ─── hello (identifies who we are) ───
         acct = live_engine.get_account_snapshot()
+        self._log("INFO", f"sending hello -- broker={acct.get('broker')} account={acct.get('account')}")
         hello = self._envelope("hello", {
             "worker_id": self.worker_id,
             "broker":    acct.get("broker"),
@@ -182,26 +238,28 @@ class Worker:
         })
         await ws.send(json.dumps(hello))
 
-        # ─── wait for hello.ack ───
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
         except asyncio.TimeoutError:
-            self.log.error("hello.ack timeout"); return
+            self._err("hello.ack timeout (Mother didn't respond in 10s)")
+            return
         msg = json.loads(raw)
         if msg.get("type") != "hello.ack":
-            self.log.error(f"expected hello.ack, got {msg.get('type')}"); return
+            self._err(f"expected hello.ack, got {msg.get('type')}")
+            return
 
         new_cfg = (msg.get("payload") or {}).get("config") or {}
         if new_cfg:
             self.active_config = new_cfg
-            self.log.info("active config received from Mother")
+            self._log("INFO", f"active config received from Mother ({len(new_cfg)} keys)")
         elif self.fallback_cfg and not self.active_config:
             self.active_config = self.fallback_cfg
-            self.log.warning("Mother sent empty config — using local fallback_config")
+            self._log("WARN", "Mother sent empty config -- using local fallback_config")
 
-        self.log.info("connected, session established")
+        self._log("INFO", "session established with Mother")
 
         if self.auto_start and self.engine_state == "STOPPED" and self.active_config:
+            self._log("INFO", "auto_start enabled -- starting strategy now")
             self.start_strategy()
 
         await self._flush_buffer(ws)
@@ -213,19 +271,23 @@ class Worker:
         ]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for t in pending: t.cancel()
+            for t in pending:
+                t.cancel()
             for t in done:
                 exc = t.exception()
                 if exc and not isinstance(exc, asyncio.CancelledError):
                     self.log.warning(f"session task {t.get_name()} ended: {exc}")
         finally:
             for t in tasks:
-                if not t.done(): t.cancel()
+                if not t.done():
+                    t.cancel()
 
     async def _recv_loop(self, ws):
         async for raw in ws:
-            try:    msg = json.loads(raw)
-            except Exception: continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
             await self._handle_command(ws, msg)
 
     async def _handle_command(self, ws, msg):
@@ -233,22 +295,26 @@ class Worker:
         payload = msg.get("payload") or {}
 
         if mtype == "cmd.start":
-            ok = self.start_strategy(); self.log.info(f"cmd.start → {ok}")
+            ok = self.start_strategy()
+            self._log("INFO", f"cmd.start -> ok={ok}")
         elif mtype == "cmd.stop":
-            ok = self.stop_strategy();  self.log.info(f"cmd.stop → {ok}")
+            ok = self.stop_strategy()
+            self._log("INFO", f"cmd.stop -> ok={ok}")
         elif mtype == "cmd.restart":
-            ok = self.restart_strategy(); self.log.info(f"cmd.restart → {ok}")
+            ok = self.restart_strategy()
+            self._log("INFO", f"cmd.restart -> ok={ok}")
         elif mtype == "cmd.reload_config":
             new_cfg = payload.get("config") or {}
             self.active_config = new_cfg
-            self.log.info("config reloaded from Mother")
+            self._log("INFO", f"cmd.reload_config -- {len(new_cfg)} keys")
             if self.strategy_thread and self.strategy_thread.is_alive():
-                self.log.info("strategy running — restarting to apply new config")
+                self._log("INFO", "strategy running -- restarting to apply new config")
                 self.restart_strategy()
         elif mtype == "cmd.ping":
             await ws.send(json.dumps(self._envelope("ack", {"of": "cmd.ping"})))
+            self._log("INFO", "cmd.ping -> ack")
         else:
-            self.log.warning(f"unknown command: {mtype}")
+            self._log("WARN", f"unknown command: {mtype}")
 
     async def _send_loop(self, ws):
         while True:
@@ -258,7 +324,8 @@ class Worker:
                 await ws.send(json.dumps(envelope, default=str))
             except Exception as e:
                 self.log.warning(f"send failed, buffering event {ev['type']}: {e}")
-                self._buffer_event(envelope); raise
+                self._buffer_event(envelope)
+                raise
 
     def _buffer_event(self, envelope):
         if len(self.outbound_buffer) >= MAX_BUFFER:
@@ -270,22 +337,27 @@ class Worker:
         self.outbound_buffer.append(envelope)
 
     async def _flush_buffer(self, ws):
-        if not self.outbound_buffer: return
-        self.log.info(f"flushing {len(self.outbound_buffer)} buffered events…")
+        if not self.outbound_buffer:
+            return
+        self.log.info(f"flushing {len(self.outbound_buffer)} buffered events...")
         while self.outbound_buffer:
             ev = self.outbound_buffer.popleft()
-            try:    await ws.send(json.dumps(ev, default=str))
+            try:
+                await ws.send(json.dumps(ev, default=str))
             except Exception as e:
                 self.outbound_buffer.appendleft(ev)
-                self.log.warning(f"flush failed: {e}"); return
+                self.log.warning(f"flush failed: {e}")
+                return
 
     async def _heartbeat_loop(self, ws):
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             envelope = self._envelope("heartbeat", self._build_heartbeat())
-            try:    await ws.send(json.dumps(envelope, default=str))
+            try:
+                await ws.send(json.dumps(envelope, default=str))
             except Exception as e:
-                self.log.warning(f"heartbeat send failed: {e}"); raise
+                self.log.warning(f"heartbeat send failed: {e}")
+                raise
 
     def _build_heartbeat(self):
         acct = live_engine.get_account_snapshot()
@@ -322,23 +394,22 @@ class Worker:
         self.shutdown_evt = asyncio.Event()
         if self.auto_start and self.fallback_cfg and self.engine_state == "STOPPED":
             self.active_config = self.fallback_cfg
-            self.log.info("preemptively starting strategy with fallback_config")
+            self._log("INFO", "preemptive start with fallback_config (Mother not yet contacted)")
             self.start_strategy()
         try:
             await self.ws_supervisor()
         except asyncio.CancelledError:
             pass
         finally:
-            self.log.info("shutdown initiated, stopping strategy…")
+            self._log("INFO", "shutdown initiated, stopping strategy...")
             self.stop_strategy(timeout=10)
             self.log.info("worker exit")
 
 
-# ─── boot ─────────────────────────────────────────────────────────
 def main():
     if not CONFIG_FILE.exists():
         print(f"FATAL: {CONFIG_FILE} not found"); sys.exit(1)
-    with open(CONFIG_FILE) as f:
+    with open(CONFIG_FILE, encoding="utf-8") as f:
         cfg = json.load(f)
     for required in ("worker_id", "mother_url"):
         if required not in cfg:
