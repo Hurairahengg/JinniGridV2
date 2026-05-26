@@ -1,7 +1,4 @@
 {
-  "auth_token": "1kMhRm8YY7HmLJLdeHe3PAztls2ziEygOFHAi34EJ30qE0odu4cicnDADUf3jZLDX",
-  "auto_start": true,
-
   "symbol": "USTEC",
   "brick_size": 8.0,
   "rev_bricks": 2.0,
