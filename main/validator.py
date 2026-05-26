@@ -1,28 +1,26 @@
 """
 validator.py — Backtest re-runner / trade validator.
 
-For each closed live trade, takes the captured bars and re-runs the EXACT
-same strategy logic (matching the original Python backtester). Compares
-expected vs actual entry/exit/PnL and returns a verdict.
-
-Can also be run standalone:  python validator.py
+Reads strategy params from the trade record itself (embedded by live_engine
+at order open). No more module-level constants drifting out of sync.
 """
 
 import json
 import os
 
-# ─── MUST MATCH live_engine.py ───────────────────────────────────
-STREAK_SIZE        = 3
-TP_CLOSE_AFTER     = 3
-FIXED_SL_POINTS    = 16.0
-SLIPPAGE_POINTS    = 0.3
-COMMISSION_PER_LOT = 0.8
+# ─── default fallbacks if a (legacy) trade has no embedded params ────
+DEFAULT_PARAMS = {
+    "streak_size":        2,
+    "tp_close_after":     3,
+    "fixed_sl_points":    16.0,
+    "slippage_points":    0.3,
+    "commission_per_lot": 0.8,
+}
 
 # tolerances for "match"
-PRICE_TOL_PTS      = 2.0     # entry/exit price tolerance
-PNL_TOL_DOLLARS    = 2.0     # absolute $ tolerance
-PNL_TOL_PCT        = 10.0    # OR % tolerance, whichever bigger
-# ─────────────────────────────────────────────────────────────────
+PRICE_TOL_PTS   = 2.0
+PNL_TOL_DOLLARS = 2.0
+PNL_TOL_PCT     = 10.0
 
 TRADE_LOG = "trades_log.json"
 
@@ -35,27 +33,39 @@ def direction(candle):
     return 0
 
 
-def simulate_trade(bars, signal_idx, lots):
-    """
-    Re-runs the backtester logic on a window of bars where:
-      bars[signal_idx - STREAK_SIZE : signal_idx]   = streak
-      bars[signal_idx]                              = reversal
-      bars[signal_idx + 1]                          = entry bar
-      bars[signal_idx + 1 .. signal_idx + 1 + TP_CLOSE_AFTER] = walk-forward
+def _params_from(record):
+    """Pull strategy params from the trade record, with safe fallbacks."""
+    return {
+        "streak_size":        record.get("streak_size",        DEFAULT_PARAMS["streak_size"]),
+        "tp_close_after":     record.get("tp_close_after",     DEFAULT_PARAMS["tp_close_after"]),
+        "fixed_sl_points":    record.get("sl_pts",             DEFAULT_PARAMS["fixed_sl_points"]),
+        "slippage_points":    record.get("slippage_points",    DEFAULT_PARAMS["slippage_points"]),
+        "commission_per_lot": record.get("commission_per_lot", DEFAULT_PARAMS["commission_per_lot"]),
+    }
 
-    Tolerates partial walk-forward (e.g., SL hit before all TP bars elapsed).
-    """
-    # ─── diagnostic ───
-    diag = f"len(bars)={len(bars)} signal_idx={signal_idx} STREAK_SIZE={STREAK_SIZE} TP_AFTER={TP_CLOSE_AFTER}"
 
-    # ─── validate streak ───
-    if signal_idx < STREAK_SIZE:
+def simulate_trade(bars, signal_idx, lots, params):
+    """
+    Re-runs backtester logic on the trade's captured bar window.
+    Uses params from the trade record (not module globals).
+    """
+    streak_size        = params["streak_size"]
+    tp_close_after     = params["tp_close_after"]
+    fixed_sl_points    = params["fixed_sl_points"]
+    slippage_points    = params["slippage_points"]
+    commission_per_lot = params["commission_per_lot"]
+
+    diag = (f"len(bars)={len(bars)} signal_idx={signal_idx} "
+            f"STREAK_SIZE={streak_size} TP_AFTER={tp_close_after}")
+
+    # ─── streak validation ───
+    if signal_idx < streak_size:
         return {"ok": False, "reason": f"not enough streak bars ({diag})"}
 
-    streak_dir = direction(bars[signal_idx - STREAK_SIZE])
+    streak_dir = direction(bars[signal_idx - streak_size])
     if streak_dir == 0:
         return {"ok": False, "reason": f"streak base bar is doji ({diag})"}
-    for j in range(signal_idx - STREAK_SIZE, signal_idx):
+    for j in range(signal_idx - streak_size, signal_idx):
         if direction(bars[j]) != streak_dir:
             return {"ok": False, "reason": f"streak invalid at j={j} ({diag})"}
 
@@ -67,19 +77,18 @@ def simulate_trade(bars, signal_idx, lots):
     if entry_idx >= len(bars):
         return {"ok": False, "reason": f"no entry bar ({diag})"}
 
-    # tp_idx might exceed available walk-forward bars if SL hit early — that's fine, we cap it
-    tp_idx_ideal = entry_idx + TP_CLOSE_AFTER
+    tp_idx_ideal = entry_idx + tp_close_after
     tp_idx = min(tp_idx_ideal, len(bars) - 1)
     walk_truncated = tp_idx < tp_idx_ideal
 
     # ─── entry ───
     raw_entry = bars[entry_idx]["open"]
     if reversal_dir == 1:
-        entry_price = raw_entry + SLIPPAGE_POINTS
-        sl_price    = entry_price - FIXED_SL_POINTS
+        entry_price = raw_entry + slippage_points
+        sl_price    = entry_price - fixed_sl_points
     else:
-        entry_price = raw_entry - SLIPPAGE_POINTS
-        sl_price    = entry_price + FIXED_SL_POINTS
+        entry_price = raw_entry - slippage_points
+        sl_price    = entry_price + fixed_sl_points
 
     # ─── walk forward ───
     hit_sl = False
@@ -89,33 +98,30 @@ def simulate_trade(bars, signal_idx, lots):
         bar = bars[k]
         if reversal_dir == 1:
             if bar["open"] <= sl_price:
-                exit_price = bar["open"] - SLIPPAGE_POINTS
+                exit_price = bar["open"] - slippage_points
                 hit_sl = True; exit_idx = k; break
-            if bar["low"]  <= sl_price:
-                exit_price = sl_price - SLIPPAGE_POINTS
+            if bar["low"] <= sl_price:
+                exit_price = sl_price - slippage_points
                 hit_sl = True; exit_idx = k; break
         else:
             if bar["open"] >= sl_price:
-                exit_price = bar["open"] + SLIPPAGE_POINTS
+                exit_price = bar["open"] + slippage_points
                 hit_sl = True; exit_idx = k; break
             if bar["high"] >= sl_price:
-                exit_price = sl_price + SLIPPAGE_POINTS
+                exit_price = sl_price + slippage_points
                 hit_sl = True; exit_idx = k; break
 
     if not hit_sl:
         if walk_truncated:
-            # walk-forward was cut short (live SL fired before full window).
-            # Can't simulate a TP exit — mark as inconclusive.
             return {"ok": False, "reason": f"walk-forward truncated, can't simulate TP ({diag})"}
         raw_tp = bars[tp_idx]["close"]
-        exit_price = raw_tp - SLIPPAGE_POINTS if reversal_dir == 1 else raw_tp + SLIPPAGE_POINTS
+        exit_price = raw_tp - slippage_points if reversal_dir == 1 else raw_tp + slippage_points
         exit_idx = tp_idx
 
-    # ─── pnl ───
-    pnl_points    = (exit_price - entry_price) if reversal_dir == 1 else (entry_price - exit_price)
-    gross_pnl     = pnl_points * lots
-    commission    = lots * COMMISSION_PER_LOT
-    net_pnl       = gross_pnl - commission
+    pnl_points = (exit_price - entry_price) if reversal_dir == 1 else (entry_price - exit_price)
+    gross_pnl  = pnl_points * lots
+    commission = lots * commission_per_lot
+    net_pnl    = gross_pnl - commission
 
     return {
         "ok": True,
@@ -133,16 +139,12 @@ def simulate_trade(bars, signal_idx, lots):
 
 
 def validate_trade(record):
-    """
-    record = single trade dict written by live_engine.py
-    contains the bars window + actual fills.
-    Returns verdict dict.
-    """
     bars       = record["bars_window"]
     signal_idx = record["signal_idx_in_window"]
     lots       = record["lots"]
+    params     = _params_from(record)
 
-    sim = simulate_trade(bars, signal_idx, lots)
+    sim = simulate_trade(bars, signal_idx, lots, params)
     if not sim["ok"]:
         return {
             "match": False,
@@ -152,7 +154,6 @@ def validate_trade(record):
             "pnl_diff_pct": 0.0,
         }
 
-    # compare
     actual_entry = record["actual_entry"]
     actual_exit  = record["actual_exit"]
     actual_pnl   = record["net_pnl"]
@@ -171,7 +172,8 @@ def validate_trade(record):
     if abs(pnl_diff) > PNL_TOL_DOLLARS and abs(pnl_diff_pct) > PNL_TOL_PCT:
         reasons.append(f"pnl_off_${pnl_diff:+.2f}")
     if record["hit_sl"] != sim["hit_sl"]:
-        reasons.append(f"exit_reason_mismatch (live={'SL' if record['hit_sl'] else 'TP'}, sim={'SL' if sim['hit_sl'] else 'TP'})")
+        reasons.append(f"exit_reason_mismatch (live={'SL' if record['hit_sl'] else 'TP'}, "
+                       f"sim={'SL' if sim['hit_sl'] else 'TP'})")
 
     return {
         "match": len(reasons) == 0,
@@ -183,30 +185,26 @@ def validate_trade(record):
         "pnl_diff":       pnl_diff,
         "pnl_diff_pct":   pnl_diff_pct,
         "expected_hit_sl": sim["hit_sl"],
+        "params_used":    params,
     }
 
 
-# ─── standalone runner ───────────────────────────────────────────
+# ─── standalone runner ──────────────────────────────────────────
 def _run_standalone():
     if not os.path.exists(TRADE_LOG):
-        print(f"no log file: {TRADE_LOG}")
-        return
+        print(f"no log file: {TRADE_LOG}"); return
     with open(TRADE_LOG) as f:
         log = json.load(f)
-
-    matches = 0
-    mismatches = 0
+    matches = mismatches = 0
     for i, rec in enumerate(log):
         if rec.get("status") != "closed":
             continue
         v = validate_trade(rec)
         tag = "✅ MATCH" if v["match"] else "⚠️ MISMATCH"
         print(f"#{i+1:>3} {tag}  actual=${rec['net_pnl']:+.2f}  "
-              f"expected=${v['expected_pnl']:+.2f}  diff=${v['pnl_diff']:+.2f}  "
-              f"({v['reason']})")
+              f"expected=${v['expected_pnl']:+.2f}  diff=${v['pnl_diff']:+.2f}  ({v['reason']})")
         if v["match"]: matches += 1
         else:          mismatches += 1
-
     print(f"\nTotal: {matches} match / {mismatches} mismatch")
 
 

@@ -1,12 +1,12 @@
 """
-live_engine.py — Live execution for the 3-streak / 3-TP / 16pt-SL strategy.
+live_engine.py — Live execution for the 2-streak / 3-TP / 16pt-SL strategy.
 
 - Symbol:   USTEC
 - Bars:     8pt Koko (grid-anchored range bars), rev_bricks=2, clean_mode=OFF
-- Strategy: streak_size=3, tp_close_after=3, FIXED_SL=16pt
+- Strategy: streak_size=2, tp_close_after=3, FIXED_SL=16pt
 - Warmup:   100 bars from MT5 tick history
 - Memory:   max 100 bars in RAM at all times
-- Match:    bar generator & strategy port the original Python 1:1
+- Match:    1:1 with backtester INCLUDING overlapping trades (i+=1 behavior)
 """
 
 import os
@@ -46,7 +46,7 @@ COMMISSION_PER_LOT  = 0.8
 
 # Risk — matches backtester scaling model
 RISK_PER_100        = 1.0     # $ risked per $100 of balance (1.0 = 1%)
-SCALING_ENABLED     = True   # True = check live balance each trade
+SCALING_ENABLED     = True    # True = check live balance each trade
                               # False = lock to STARTING_BALANCE for all trades
 STARTING_BALANCE    = 3100.0  # used when SCALING_ENABLED = False
 POINT_VALUE_PER_LOT = 1.0     # $/pt/lot for USTEC. VERIFY YOUR BROKER.
@@ -59,11 +59,12 @@ ORDER_COMMENT       = "JinniSnapback"
 DEVIATION_POINTS    = 30     # max slippage MT5 will accept on market order
 
 # Loop
-TICK_POLL_INTERVAL  = 0.05  # seconds between tick polls
+TICK_POLL_INTERVAL  = 0.05   # seconds between tick polls
 HISTORY_LOOKBACK_DAYS = 14   # how far back to scan ticks for warmup
 
 # Files
 TRADE_LOG_FILE      = "trades_log.json"
+
 
 # ═════════════════════════════════════════════════════════════════
 # LIVE KOKO BAR STREAMER  (in-memory mirror of range_bars.py)
@@ -94,7 +95,6 @@ class LiveKokoCandleStreamer:
         return round(round(price / self.rs) * self.rs, self.pd)
 
     def _emit(self, open_, high_, low_, close_, ts, volume):
-        # de-dup timestamps (mirror original)
         if self._last_written_ts is not None and ts <= self._last_written_ts:
             ts = self._last_written_ts + 1
         self._last_written_ts = ts
@@ -217,7 +217,7 @@ def save_log(log):
 
 
 # ═════════════════════════════════════════════════════════════════
-# STRATEGY ENGINE
+# STRATEGY ENGINE — concurrent / overlapping trades, 1:1 with backtester
 # ═════════════════════════════════════════════════════════════════
 def direction(c):
     if c["close"] > c["open"]: return 1
@@ -245,21 +245,17 @@ def get_current_risk():
 
 class StrategyEngine:
     """
-    State machine:
-        IDLE  →  signal found on emitted bar  →  place market order  →  IN_TRADE
-        IN_TRADE  →  bars_since_entry counter ticks each new bar
-                  →  exit on bar_count == TP_CLOSE_AFTER + 1 (TP), or MT5 SL trigger
-                  →  log + telegram + validate  →  IDLE
-    """
+    NEW: concurrent positions allowed. Signals fire on EVERY bar regardless of
+    whether other positions are open. This mirrors backtester's `i += 1`
+    behavior where overlapping trades are counted as separate trades.
 
-    STATE_IDLE     = "IDLE"
-    STATE_IN_TRADE = "IN_TRADE"
+    Each open trade in self.open_trades is an independent dict with its own
+    ticket, bars_since_entry counter, bars_window, etc.
+    """
 
     def __init__(self, streamer):
         self.streamer = streamer
-        self.state = self.STATE_IDLE
-        self.open_trade = None         # dict for currently-open trade
-        self.bars_since_entry = 0      # increments on every NEW bar emit after entry
+        self.open_trades = []          # list of open trade dicts
         self.live_bars_seen = 0        # post-warmup bars only — signals gated on this
 
     # ─── called by streamer for EVERY new bar (live + warmup) ───
@@ -269,18 +265,15 @@ class StrategyEngine:
 
         self.live_bars_seen += 1
 
-        if self.state == self.STATE_IN_TRADE:
-            self.bars_since_entry += 1
-            # NEW: append this bar to the trade's window in real-time
-            if self.open_trade is not None:
-                self.open_trade["bars_window"].append(bar)
-            # exit on TP if we've held through (TP_CLOSE_AFTER + 1) bars
-            if self.bars_since_entry >= TP_CLOSE_AFTER + 1:
-                self._close_trade_tp(bar)
-                return
-            return
+        # ── 1) increment all open trades' bar counters & check for TP exits ──
+        # iterate over a copy because _close_trade_tp will mutate self.open_trades
+        for trade in list(self.open_trades):
+            trade["bars_since_entry"] += 1
+            trade["bars_window"].append(bar)
+            if trade["bars_since_entry"] >= TP_CLOSE_AFTER + 1:
+                self._close_trade_tp(trade, bar)
 
-        # IDLE — only allow signals once we have enough LIVE bars (no warmup contamination)
+        # ── 2) always scan for new signal (overlap allowed, matches backtester) ──
         required_live_bars = STREAK_SIZE + 1   # streak + reversal bar
         if self.live_bars_seen < required_live_bars:
             print(f"[live] bar #{self.live_bars_seen}/{required_live_bars} — building live history, no signals yet")
@@ -305,7 +298,7 @@ class StrategyEngine:
             if direction(b) != streak_dir:
                 return
 
-        # ─── SIGNAL VALID — fire order ───
+        # ─── SIGNAL VALID — fire order (concurrent allowed) ───
         self._open_trade(reversal_dir, bars, streak_slice, signal_bar)
 
     # ─── ORDER EXECUTION ────────────────────────────────────────
@@ -341,7 +334,6 @@ class StrategyEngine:
         tick = mt5.symbol_info_tick(SYMBOL)
         price = tick.ask if reversal_dir == 1 else tick.bid
 
-        # compute live SL price based on actual ask/bid
         if reversal_dir == 1:
             live_sl = round(price - FIXED_SL_POINTS, PRICE_DECIMALS)
         else:
@@ -369,10 +361,8 @@ class StrategyEngine:
         actual_entry = result.price
         ticket = result.order
 
-        # build bars window for validator (streak + reversal + entry-bar-placeholder slots)
-        # we'll backfill walk-forward bars as they emit, but store snapshot now
         bars_window = list(streak_slice) + [signal_bar]
-        signal_idx_in_window = len(bars_window) - 1   # reversal bar position
+        signal_idx_in_window = len(bars_window) - 1
 
         trade = {
             "status":            "open",
@@ -389,30 +379,29 @@ class StrategyEngine:
             "theoretical_sl":    theo_sl,
             "actual_sl":         live_sl,
             "sl_price":          live_sl,
-            "sl_pts":            FIXED_SL_POINTS,
+            "sl_pts":             FIXED_SL_POINTS,
             "streak_summary":    " ".join(f"{'+' if direction(b)==1 else '-'}" for b in streak_slice),
             "reversal_summary":  f"{'+' if reversal_dir==1 else '-'} O={signal_bar['open']} C={signal_bar['close']}",
-            # validator needs these:
-            "bars_window":            bars_window,    # will append walk-forward bars on close
+            "bars_window":            bars_window,
             "signal_idx_in_window":   signal_idx_in_window,
-            "entry_global_idx":       self.streamer.global_bar_count,  # next bar will be entry bar
+            "entry_global_idx":       self.streamer.global_bar_count,
+            # per-trade counter (replaces old single-trade state machine)
+            "bars_since_entry":       0,
         }
 
-        self.open_trade = trade
-        self.bars_since_entry = 0
-        self.state = self.STATE_IN_TRADE
+        self.open_trades.append(trade)
 
         telegram_bot.send_signal(trade)
-        print(f"[trade] OPEN  ticket={ticket} dir={reversal_dir} entry={actual_entry} sl={live_sl} lots={lots}")
+        print(f"[trade] OPEN  ticket={ticket} dir={reversal_dir} entry={actual_entry} "
+              f"sl={live_sl} lots={lots} | concurrent_open={len(self.open_trades)}")
 
-    def _close_trade_tp(self, exit_bar):
-        """Send market close at the moment the TP bar emits."""
-        if self.open_trade is None: return
-        ticket = self.open_trade["ticket"]
+    def _close_trade_tp(self, trade, exit_bar):
+        """Send market close at the moment the TP bar emits for the given trade."""
+        ticket = trade["ticket"]
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
             # position already closed (SL hit before we got here) — handle via reconcile
-            self._reconcile_closed_position(ticket, exit_bar, exit_reason="sl_or_external")
+            self._reconcile_closed_position(trade, exit_bar)
             return
 
         pos = positions[0]
@@ -437,41 +426,42 @@ class StrategyEngine:
         result = mt5.order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             err = result.comment if result else mt5.last_error()
-            telegram_bot.send_error(f"TP close failed: {err}")
+            telegram_bot.send_error(f"TP close failed for ticket {ticket}: {err}")
             return
 
-        self._finalize_trade(exit_bar, result.price, hit_sl=False)
+        self._finalize_trade(trade, exit_bar, result.price, hit_sl=False)
 
-    def _reconcile_closed_position(self, ticket, exit_bar, exit_reason):
+    def _reconcile_closed_position(self, trade, exit_bar):
         """If MT5 already closed the position (SL trigger), pull deal info and finalize."""
-        # find the closing deal
+        ticket = trade["ticket"]
         from_time = datetime.now(timezone.utc) - timedelta(hours=24)
         deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
         if not deals:
             telegram_bot.send_error(f"could not find closing deal for ticket {ticket}")
+            # remove from open list anyway to prevent loop spam
+            if trade in self.open_trades:
+                self.open_trades.remove(trade)
             return
         close_deal = max(deals, key=lambda d: d.time)
-        self._finalize_trade(exit_bar, close_deal.price, hit_sl=True)
+        self._finalize_trade(trade, exit_bar, close_deal.price, hit_sl=True)
 
-    def _finalize_trade(self, exit_bar, actual_exit, hit_sl):
-        t = self.open_trade
-        actual_entry = t["actual_entry"]
-        is_long = t["dir"] == 1
+    def _finalize_trade(self, trade, exit_bar, actual_exit, hit_sl):
+        actual_entry = trade["actual_entry"]
+        is_long = trade["dir"] == 1
         pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
-        gross_pnl  = pnl_points * t["lots"] * POINT_VALUE_PER_LOT
-        commission = t["lots"] * COMMISSION_PER_LOT
+        gross_pnl  = pnl_points * trade["lots"] * POINT_VALUE_PER_LOT
+        commission = trade["lots"] * COMMISSION_PER_LOT
         net_pnl    = gross_pnl - commission
 
-        # bars_window has been collected live during the trade (see on_bar).
-        # Sanity check it:
-        expected_total = (STREAK_SIZE + 1) + self.bars_since_entry
-        actual_total   = len(t["bars_window"])
+        # sanity check bars_window length
+        expected_total = (STREAK_SIZE + 1) + trade["bars_since_entry"]
+        actual_total   = len(trade["bars_window"])
         if actual_total != expected_total:
-            print(f"[validator] ⚠️ bars_window size mismatch: "
+            print(f"[validator] ⚠️ bars_window size mismatch ticket={trade['ticket']}: "
                   f"expected={expected_total} actual={actual_total} "
-                  f"bars_since_entry={self.bars_since_entry}")
+                  f"bars_since_entry={trade['bars_since_entry']}")
 
-        t.update({
+        trade.update({
             "status":      "closed",
             "exit_time":   datetime.now(timezone.utc).isoformat(),
             "actual_exit": actual_exit,
@@ -480,39 +470,41 @@ class StrategyEngine:
             "gross_pnl":   gross_pnl,
             "commission":  commission,
             "net_pnl":     net_pnl,
-            "bars_held":   self.bars_since_entry,
-            "r_multiple":  net_pnl / t["risk_used"] if t["risk_used"] > 0 else 0.0,
+            "bars_held":   trade["bars_since_entry"],
+            "r_multiple":  net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
         })
 
         # validate
-        verdict = validator.validate_trade(t)
-        t["validator_verdict"] = verdict
+        verdict = validator.validate_trade(trade)
+        trade["validator_verdict"] = verdict
 
         # log
         log = load_log()
-        log.append(t)
+        log.append(trade)
         save_log(log)
 
         # notify
-        telegram_bot.send_close(t, verdict)
+        telegram_bot.send_close(trade, verdict)
         match_tag = "MATCH" if verdict["match"] else "MISMATCH"
-        print(f"[trade] CLOSE ticket={t['ticket']} pnl=${net_pnl:+.2f} "
-              f"reason={'SL' if hit_sl else 'TP'} validator={match_tag}")
+        print(f"[trade] CLOSE ticket={trade['ticket']} pnl=${net_pnl:+.2f} "
+              f"reason={'SL' if hit_sl else 'TP'} validator={match_tag} | "
+              f"remaining_open={len(self.open_trades) - 1}")
 
-        self.open_trade = None
-        self.state = self.STATE_IDLE
-        self.bars_since_entry = 0
+        # remove from open list
+        if trade in self.open_trades:
+            self.open_trades.remove(trade)
 
-    # ─── poll MT5 each loop to detect broker-side SL closure ────
+    # ─── poll MT5 each loop to detect broker-side SL closure on ANY open trade ────
     def poll_position_status(self):
-        if self.state != self.STATE_IN_TRADE: return
-        if self.open_trade is None: return
-        ticket = self.open_trade["ticket"]
-        positions = mt5.positions_get(ticket=ticket)
-        if not positions:
-            # position closed by SL (or manual). reconcile.
-            last_bar = self.streamer.bars[-1] if self.streamer.bars else None
-            self._reconcile_closed_position(ticket, last_bar, exit_reason="sl")
+        if not self.open_trades:
+            return
+        for trade in list(self.open_trades):
+            ticket = trade["ticket"]
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                # position closed by SL (or manual). reconcile.
+                last_bar = self.streamer.bars[-1] if self.streamer.bars else None
+                self._reconcile_closed_position(trade, last_bar)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -544,7 +536,6 @@ def warmup(streamer):
         streamer.process_tick(ts, price, vol)
 
         if streamer.global_bar_count >= WARMUP_BARS:
-            # keep going a bit to ensure deque is filled but we have enough
             if len(streamer.bars) >= MAX_BARS_IN_MEM:
                 break
 
@@ -587,7 +578,7 @@ def main():
         "slippage":         SLIPPAGE_POINTS,
     })
 
-    is_warmup = [True]   # mutable holder so closure can flip it
+    is_warmup = [True]
 
     streamer = LiveKokoCandleStreamer(
         range_size=BRICK_SIZE,
@@ -618,9 +609,8 @@ def main():
     try:
         while True:
             try:
-                # fetch new ticks since last seen
                 now_dt = datetime.now(timezone.utc)
-                from_ts = last_tick_ts + 1  # ms
+                from_ts = last_tick_ts + 1
                 new_ticks = mt5.copy_ticks_from(
                     SYMBOL,
                     datetime.fromtimestamp(from_ts / 1000.0, tz=timezone.utc),
@@ -645,7 +635,6 @@ def main():
                         vol = float(t["volume"])
                         streamer.process_tick(ts, price, vol)
 
-                # check if MT5 closed our position out-of-band (SL hit)
                 engine.poll_position_status()
 
             except KeyboardInterrupt:
