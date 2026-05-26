@@ -44,10 +44,14 @@ def list_configs():
 
 
 # ─── fleet manager ──────────────────────────────────────────────
+BAR_HISTORY_LEN = 300   # ring buffer per worker for charts
+
 class FleetManager:
     def __init__(self):
         self.workers = {}          # worker_id -> WebSocket
         self.ui_clients = set()
+        self.bar_history = {}      # worker_id -> deque of bars
+        self.recent_trade_markers = {}  # worker_id -> deque of {ts, type, price, dir}
 
     async def attach(self, worker_id, ws, hello_payload):
         if worker_id in self.workers:
@@ -81,17 +85,30 @@ class FleetManager:
             telegram_bot.send_status(f"🔴 Worker {worker_id} disconnected")
         except Exception:
             pass
-
+    def _add_trade_marker(self, worker_id, trade, marker_type):
+        from collections import deque
+        buf = self.recent_trade_markers.setdefault(worker_id, deque(maxlen=100))
+        buf.append({
+            "ts":    trade.get("entry_time") if marker_type == "open" else trade.get("exit_time"),
+            "type":  marker_type,
+            "dir":   trade.get("dir"),
+            "price": trade.get("actual_entry") if marker_type == "open" else trade.get("actual_exit"),
+            "net_pnl": trade.get("net_pnl"),
+            "ticket": trade.get("ticket"),
+        })
+        
     async def handle_message(self, worker_id, msg):
         mtype   = msg.get("type")
         payload = msg.get("payload", {}) or {}
 
         if mtype == "heartbeat":
             store.update_heartbeat(worker_id, payload)
+            self._add_trade_marker(worker_id, payload, marker_type="open")
             await self._broadcast_ui({"type": "heartbeat", "worker_id": worker_id, "payload": payload})
 
         elif mtype == "trade.opened":
             store.insert_open_trade(worker_id, payload)
+            self._add_trade_marker(worker_id, payload, marker_type="close")
             store.insert_event(worker_id, "trade.opened", "system", {"ticket": payload.get("ticket")})
             try:    telegram_bot.send_signal(payload)
             except Exception as e: store.insert_log(worker_id, "ERROR", f"telegram send_signal failed: {e}")
@@ -114,7 +131,12 @@ class FleetManager:
             except Exception as e: store.insert_log(worker_id, "ERROR", f"telegram send_close failed: {e}")
             await self._broadcast_ui({"type": "trade.closed", "worker_id": worker_id,
                                       "payload": payload, "verdict": verdict})
-
+        elif mtype == "bar":
+            from collections import deque
+            buf = self.bar_history.setdefault(worker_id, deque(maxlen=BAR_HISTORY_LEN))
+            buf.append(payload.get("bar"))
+            await self._broadcast_ui({"type": "bar", "worker_id": worker_id, "payload": payload})
+            
         elif mtype == "log":
             store.insert_log(worker_id, payload.get("level", "INFO"),
                              payload.get("message", ""), payload.get("context"))

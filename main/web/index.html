@@ -1,86 +1,276 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="midnight">
 <head>
   <meta charset="utf-8" />
-  <title>Jinni Grid — Mother</title>
-  <link rel="stylesheet" href="/web/style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jinni Grid · Mission Control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  /web/style.css
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
-  <header>
-    <h1>🤖 JINNI GRID</h1>
-    <div id="conn-status" class="conn off">disconnected</div>
-  </header>
 
-  <nav>
-    <button class="tab active" data-tab="fleet">Fleet</button>
-    <button class="tab" data-tab="trades">Trades</button>
-    <button class="tab" data-tab="logs">Logs</button>
-    <button class="tab" data-tab="configs">Configs</button>
-  </nav>
+<!-- ═════════════ AMBIENT BACKGROUND ═════════════ -->
+<div class="ambient">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="grid-overlay"></div>
+</div>
 
-  <main>
-    <!-- ── FLEET ── -->
-    <section id="tab-fleet" class="tab-pane active">
-      <div class="portfolio">
-        <div class="stat"><label>Trades</label><span id="pf-n">–</span></div>
-        <div class="stat"><label>Net PnL</label><span id="pf-pnl">–</span></div>
-        <div class="stat"><label>Win Rate</label><span id="pf-wr">–</span></div>
-        <div class="stat"><label>W / L</label><span id="pf-wl">–</span></div>
+<!-- ═════════════ TOPBAR ═════════════ -->
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">◆</div>
+    <div class="brand-text">
+      <div class="brand-title">JINNI GRID</div>
+      <div class="brand-sub">mission control</div>
+    </div>
+  </div>
+
+  <button id="cmd-trigger" class="cmd-trigger">
+    <span class="cmd-icon">⌕</span>
+    <span class="cmd-text">Search workers, trades, commands…</span>
+    <span class="cmd-kbd"><kbd>⌘</kbd><kbd>K</kbd></span>
+  </button>
+
+  <div class="topbar-right">
+    <div id="alert-pill" class="alert-pill hidden">
+      <span class="alert-dot"></span>
+      <span id="alert-count">0</span>
+    </div>
+    <div class="status-pill" id="conn-pill">
+      <span class="status-dot"></span>
+      <span id="conn-text">connecting</span>
+    </div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<!-- ═════════════ SIDEBAR ═════════════ -->
+<nav class="sidebar">
+  <button class="nav-item active" data-page="home"   title="Mission Control">
+    <span class="nav-icon">◉</span><span class="nav-label">Mission</span>
+  </button>
+  <button class="nav-item" data-page="fleet"  title="Fleet">
+    <span class="nav-icon">▦</span><span class="nav-label">Fleet</span>
+  </button>
+  <button class="nav-item" data-page="trades" title="Trades">
+    <span class="nav-icon">↯</span><span class="nav-label">Trades</span>
+  </button>
+  <button class="nav-item" data-page="charts" title="Live Charts">
+    <span class="nav-icon">▲</span><span class="nav-label">Charts</span>
+  </button>
+  <button class="nav-item" data-page="logs"   title="Logs">
+    <span class="nav-icon">≡</span><span class="nav-label">Logs</span>
+  </button>
+  <button class="nav-item" data-page="config" title="Configs">
+    <span class="nav-icon">◈</span><span class="nav-label">Configs</span>
+  </button>
+  <div class="sidebar-spacer"></div>
+  <div class="sidebar-version">v0.1.0</div>
+</nav>
+
+<!-- ═════════════ CONTENT ═════════════ -->
+<main class="content">
+
+  <!-- ── HOME / MISSION CONTROL ── -->
+  <section class="page active" data-page="home">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Mission Control</h1>
+        <p class="page-sub">live infrastructure overview</p>
       </div>
-      <table id="fleet-table">
-        <thead><tr>
-          <th>ID</th><th>State</th><th>Broker</th><th>Account</th>
-          <th>Balance</th><th>Equity</th><th>Pos</th><th>Mem</th>
-          <th>Last HB</th><th>Actions</th>
-        </tr></thead>
-        <tbody></tbody>
-      </table>
-    </section>
-
-    <!-- ── TRADES ── -->
-    <section id="tab-trades" class="tab-pane">
-      <div class="row">
-        <label>Worker: <input id="trade-filter-worker" placeholder="(all)" /></label>
-        <label>Status:
-          <select id="trade-filter-status"><option value="">all</option>
-            <option value="open">open</option><option value="closed">closed</option></select>
-        </label>
-        <button onclick="loadTrades()">Refresh</button>
+      <div class="page-actions">
+        <span class="pulse-label"><span class="pulse-dot"></span>live</span>
       </div>
-      <table id="trades-table">
+    </header>
+
+    <div class="kpi-row">
+      <div class="kpi" id="kpi-pnl">
+        <div class="kpi-label">net pnl</div>
+        <div class="kpi-value" data-value="0">$0.00</div>
+        <div class="kpi-foot"><span class="kpi-trend">—</span> all-time</div>
+        <div class="kpi-glow"></div>
+      </div>
+      <div class="kpi" id="kpi-wr">
+        <div class="kpi-label">win rate</div>
+        <div class="kpi-value">0%</div>
+        <div class="kpi-foot"><span id="kpi-wl">0 / 0</span></div>
+        <div class="kpi-glow"></div>
+      </div>
+      <div class="kpi" id="kpi-fleet">
+        <div class="kpi-label">fleet active</div>
+        <div class="kpi-value">0 / 0</div>
+        <div class="kpi-foot">running / total</div>
+        <div class="kpi-glow"></div>
+      </div>
+      <div class="kpi" id="kpi-positions">
+        <div class="kpi-label">open positions</div>
+        <div class="kpi-value">0</div>
+        <div class="kpi-foot">across fleet</div>
+        <div class="kpi-glow"></div>
+      </div>
+    </div>
+
+    <div class="home-grid">
+      <div class="panel panel-equity">
+        <div class="panel-header">
+          <h3>Equity Curve</h3>
+          <span class="panel-sub" id="equity-sub">cumulative pnl over closed trades</span>
+        </div>
+        <div id="equity-chart" class="equity-chart"></div>
+      </div>
+
+      <div class="panel panel-fleet">
+        <div class="panel-header">
+          <h3>Fleet Pulse</h3>
+          <span class="panel-sub" id="fleet-pulse-sub">—</span>
+        </div>
+        <div id="fleet-pulse" class="fleet-pulse"></div>
+      </div>
+
+      <div class="panel panel-feed">
+        <div class="panel-header">
+          <h3>Activity Feed</h3>
+          <span class="panel-sub">realtime events</span>
+        </div>
+        <div id="activity-feed" class="activity-feed"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── FLEET ── -->
+  <section class="page" data-page="fleet">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Fleet</h1>
+        <p class="page-sub">distributed VM workers</p>
+      </div>
+    </header>
+    <div id="fleet-grid" class="fleet-grid"></div>
+  </section>
+
+  <!-- ── TRADES ── -->
+  <section class="page" data-page="trades">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Trades</h1>
+        <p class="page-sub">every fill across the fleet</p>
+      </div>
+      <div class="page-actions filters">
+        <input id="trade-filter-worker" placeholder="worker id…" />
+        <select id="trade-filter-status">
+          <option value="">all status</option>
+          <option value="open">open</option>
+          <option value="closed">closed</option>
+        </select>
+        <button class="btn-ghost" onclick="loadTrades()">↻</button>
+      </div>
+    </header>
+    <div class="panel panel-trades">
+      <table id="trades-table" class="data-table">
         <thead><tr>
-          <th>ID</th><th>Worker</th><th>Ticket</th><th>Symbol</th><th>Dir</th>
+          <th>#</th><th>Worker</th><th>Ticket</th><th>Symbol</th><th>Dir</th>
           <th>Status</th><th>Entry</th><th>Exit</th><th>Lots</th>
-          <th>Net PnL</th><th>R</th><th>Match</th>
+          <th>Net PnL</th><th>R</th><th>Validator</th>
         </tr></thead>
         <tbody></tbody>
       </table>
-    </section>
+    </div>
+  </section>
 
-    <!-- ── LOGS ── -->
-    <section id="tab-logs" class="tab-pane">
-      <div class="row">
-        <label>Worker: <input id="log-filter-worker" placeholder="(all)" /></label>
-        <label>Level:
-          <select id="log-filter-level"><option value="">all</option>
-            <option>INFO</option><option>WARN</option><option>ERROR</option></select>
-        </label>
-        <button onclick="loadLogs()">Refresh</button>
+  <!-- ── CHARTS ── -->
+  <section class="page" data-page="charts">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Live Chart</h1>
+        <p class="page-sub">range bars + trades · streaming</p>
       </div>
-      <pre id="logs-out"></pre>
-    </section>
+      <div class="page-actions filters">
+        <select id="chart-worker"></select>
+        <button class="btn-ghost" onclick="rebindChart()">↻</button>
+      </div>
+    </header>
+    <div class="chart-layout">
+      <div class="panel panel-chart">
+        <div id="live-chart" class="live-chart"></div>
+      </div>
+      <aside class="chart-side">
+        <div class="panel">
+          <div class="panel-header"><h3>State</h3></div>
+          <div class="kv">
+            <div><span>Engine</span><b id="chart-engine">—</b></div>
+            <div><span>Live bars</span><b id="chart-livebars">0</b></div>
+            <div><span>Last bar</span><b id="chart-lastts">—</b></div>
+            <div><span>Open ticket</span><b id="chart-ticket">—</b></div>
+            <div><span>Balance</span><b id="chart-balance">—</b></div>
+            <div><span>Equity</span><b id="chart-equity">—</b></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header"><h3>Recent fills</h3></div>
+          <div id="chart-fills" class="fills"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
 
-    <!-- ── CONFIGS ── -->
-    <section id="tab-configs" class="tab-pane">
-      <div class="row">
+  <!-- ── LOGS ── -->
+  <section class="page" data-page="logs">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Logs</h1>
+        <p class="page-sub">streaming from every VM</p>
+      </div>
+      <div class="page-actions filters">
+        <input id="log-filter-worker" placeholder="worker id…" />
+        <select id="log-filter-level">
+          <option value="">all levels</option>
+          <option>INFO</option><option>WARN</option><option>ERROR</option>
+        </select>
+        <label class="toggle"><input type="checkbox" id="log-autoscroll" checked /> autoscroll</label>
+        <button class="btn-ghost" onclick="loadLogs()">↻</button>
+      </div>
+    </header>
+    <div class="panel panel-logs">
+      <div id="logs-out" class="logs-out"></div>
+    </div>
+  </section>
+
+  <!-- ── CONFIG ── -->
+  <section class="page" data-page="config">
+    <header class="page-header">
+      <div>
+        <h1 class="page-title">Configs</h1>
+        <p class="page-sub">per-worker strategy parameters</p>
+      </div>
+      <div class="page-actions filters">
         <select id="config-select"></select>
-        <button onclick="loadConfig()">Load</button>
-        <button onclick="saveConfig()">Save &amp; Push</button>
+        <button class="btn-ghost" onclick="loadConfig()">load</button>
+        <button class="btn-primary" onclick="saveConfig()">save & push</button>
       </div>
-      <textarea id="config-editor" rows="28" spellcheck="false"></textarea>
-    </section>
-  </main>
+    </header>
+    <div class="panel">
+      <textarea id="config-editor" class="config-editor" spellcheck="false"></textarea>
+    </div>
+  </section>
 
-  <script src="/web/app.js"></script>
+</main>
+
+<!-- ═════════════ COMMAND PALETTE ═════════════ -->
+<div id="cmd-palette" class="overlay hidden">
+  <div class="cmd-box">
+    <input id="cmd-input" placeholder="Type a command or search…" autocomplete="off" />
+    <div id="cmd-results" class="cmd-results"></div>
+    <div class="cmd-hint"><kbd>↑↓</kbd> navigate · <kbd>↵</kbd> select · <kbd>esc</kbd> close</div>
+  </div>
+</div>
+
+<!-- ═════════════ TOAST STACK ═════════════ -->
+<div id="toast-stack" class="toast-stack"></div>
+
+/web/app.js
 </body>
 </html>

@@ -120,7 +120,24 @@ def api_worker_detail(worker_id: str):
 @app.post("/api/workers/{worker_id}/start")
 async def api_start(worker_id: str):
     ok, msg = await fleet.send_command(worker_id, "cmd.start"); return {"ok": ok, "msg": msg}
+@app.get("/api/bars/{worker_id}")
+def api_bars(worker_id: str):
+    bars = list(fleet.bar_history.get(worker_id, []))
+    markers = list(fleet.recent_trade_markers.get(worker_id, []))
+    return {"bars": bars, "markers": markers}
 
+
+@app.get("/api/equity")
+def api_equity():
+    """Cumulative net_pnl over closed trades, for the home equity curve."""
+    trades = store.list_trades(status="closed", limit=10000)
+    trades = sorted(trades, key=lambda t: t.get("exit_time") or "")
+    out, cum = [], 0.0
+    for t in trades:
+        cum += (t.get("net_pnl") or 0)
+        out.append({"ts": t.get("exit_time"), "cum": round(cum, 2),
+                    "pnl": t.get("net_pnl"), "worker": t.get("worker_id")})
+    return out
 
 @app.post("/api/workers/{worker_id}/stop")
 async def api_stop(worker_id: str):

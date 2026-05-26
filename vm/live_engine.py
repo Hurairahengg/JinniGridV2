@@ -181,10 +181,15 @@ class StrategyEngine:
             return
         self.live_bars_seen += 1
 
-        # log every live bar emitted
-        self._log("INFO", f"new bar #{self.live_bars_seen} "
-                          f"O={bar['open']} H={bar['high']} L={bar['low']} C={bar['close']} "
-                          f"dir={direction(bar):+d}")
+        # emit structured bar for the dashboard chart
+        self.on_event("bar", {
+            "bar": bar,
+            "live_bars_seen": self.live_bars_seen,
+            "engine_state": self.state,
+        })
+        # short log line
+        self._log("INFO", f"bar #{self.live_bars_seen} "
+                          f"O={bar['open']} C={bar['close']} dir={direction(bar):+d}")
 
         if self.state == self.STATE_IN_TRADE:
             self.bars_since_entry += 1
@@ -549,9 +554,6 @@ def run(config, on_event, stop_event):
                  f"poll_interval={c['tick_poll_interval']}s")
 
     consecutive_errors = 0
-    ticks_this_period = 0
-    period_start = time.time()
-    last_diag = time.time()
 
     try:
         while not stop_event.is_set():
@@ -581,19 +583,6 @@ def run(config, on_event, stop_event):
                 engine.poll_position_status()
                 consecutive_errors = 0
 
-                # periodic diagnostic every 30s
-                now = time.time()
-                if now - last_diag > 30:
-                    last_tick_info = mt5.symbol_info_tick(c["symbol"])
-                    tps = ticks_this_period / max(now - period_start, 0.001)
-                    _log("INFO", f"LIVE diag -- ticks_30s={ticks_this_period} "
-                                 f"({tps:.1f}/s) bars={len(streamer.bars)} "
-                                 f"engine={engine.state} live_bars={engine.live_bars_seen} "
-                                 f"bid={last_tick_info.bid if last_tick_info else 'n/a'} "
-                                 f"ask={last_tick_info.ask if last_tick_info else 'n/a'}")
-                    ticks_this_period = 0
-                    period_start = now
-                    last_diag = now
 
             except Exception as e:
                 consecutive_errors += 1
