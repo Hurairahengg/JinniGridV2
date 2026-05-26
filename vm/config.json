@@ -1,6 +1,6 @@
 {
   "worker_id":  "vm1",
-  "mother_url": "ws://your-mother-host:8080/ws/worker/vm1",
+  "mother_url": "ws://192.168.3.232:5000//ws/worker/vm1",
   "token":      "1MhRm8YY7HmLJLdeHe3PAztls2ziEygOFHAi34EJ30qE0odu4cicnDADUf3jZLDX",
   "auto_start": true,
 
