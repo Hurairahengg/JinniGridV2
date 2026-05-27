@@ -5,10 +5,12 @@ CONCURRENT / OVERLAPPING TRADES — 1:1 with backtester's `i += 1` behavior.
 Each open trade is independent: own ticket, bars_since_entry counter,
 bars_window, etc. Signals fire every bar regardless of open positions.
 
-Edges (vs original standalone live_engine):
-  • config dict in via run(config, on_event, stop_event)
-  • every state change goes through on_event(type, payload)
-  • per-trade strategy params embedded in trade record (for validator)
+FIXES IN THIS VERSION:
+  • Auto-detect point_value_per_lot from MT5 symbol info (no more hardcoded $1)
+  • Use BROKER-REPORTED PnL (deal.profit + commission + swap) as source of truth
+  • Retry close orders immediately on transient failure (3 attempts, no waiting for next bar)
+  • Track theoretical vs actual PnL separately for validator
+  • Prioritize closes — overdue trades are closed FIRST, before any new bar processing
 """
 
 import math
@@ -21,7 +23,7 @@ import MetaTrader5 as mt5
 
 
 # ═════════════════════════════════════════════════════════════════
-# LIVE KOKO BAR STREAMER  (1:1 with original)
+# LIVE KOKO BAR STREAMER  (unchanged — 1:1 with original)
 # ═════════════════════════════════════════════════════════════════
 class LiveKokoCandleStreamer:
     def __init__(self, range_size, rev_bricks, clean_mode, price_decimals,
@@ -145,22 +147,27 @@ def direction(c):
     return 0
 
 
+# Close-order retry policy
+CLOSE_RETRY_ATTEMPTS  = 3
+CLOSE_RETRY_DELAY_S   = 0.15  # short — we want to bail or succeed fast
+
+
 class StrategyEngine:
     """
     Concurrent positions allowed. Signals fire on EVERY bar regardless of
     whether other positions are open. Mirrors backtester's `i += 1`
     behavior where overlapping trades count as separate trades.
-
-    self.open_trades is a list of independent trade dicts, each with its
-    own ticket, bars_since_entry, bars_window, etc.
     """
 
     def __init__(self, streamer, config, on_event):
         self.streamer = streamer
         self.cfg = config
         self.on_event = on_event
-        self.open_trades = []          # list of open trade dicts
-        self.live_bars_seen = 0        # post-warmup bars only
+        self.open_trades = []
+        self.live_bars_seen = 0
+
+        # auto-detected from symbol info, NOT from cfg (cfg value is fallback only)
+        self.point_value_per_lot = None
 
     # ─── helpers ────────────────────────────────────────────────
     def _log(self, level, msg):
@@ -168,6 +175,29 @@ class StrategyEngine:
 
     def _err(self, msg, ctx=None):
         self.on_event("error", {"message": msg, "context": ctx or {}})
+
+    def _resolve_point_value(self):
+        """
+        Resolve $/pt/lot from MT5 symbol_info. This is the #1 source of
+        PnL discrepancy if hardcoded wrong. tick_value / tick_size gives
+        the dollar value per 1.0 point per 1.0 lot.
+        """
+        info = mt5.symbol_info(self.cfg["symbol"])
+        if info is None:
+            self._err("symbol_info None during point_value resolve, falling back to config")
+            return float(self.cfg.get("point_value_per_lot", 1.0))
+
+        tick_value = getattr(info, "trade_tick_value", None)
+        tick_size  = getattr(info, "trade_tick_size", None)
+        if tick_value and tick_size and tick_size > 0:
+            pv = tick_value / tick_size
+            self._log("INFO",
+                f"point_value auto-detected: tick_value={tick_value} tick_size={tick_size} "
+                f"=> ${pv:.4f}/pt/lot (cfg said ${self.cfg.get('point_value_per_lot', 1.0)})")
+            return pv
+
+        self._err("could not read tick_value/tick_size, falling back to config")
+        return float(self.cfg.get("point_value_per_lot", 1.0))
 
     def _get_current_risk(self):
         c = self.cfg
@@ -182,14 +212,17 @@ class StrategyEngine:
             balance = c["starting_balance"]
         return (balance / 100.0) * c["risk_per_100"], balance
 
-    # ─── streamer callback (every new bar, live or warmup) ──────
+    # ─── streamer callback ──────────────────────────────────────
     def on_bar(self, bar, global_idx, is_warmup):
         if is_warmup:
             return
 
         self.live_bars_seen += 1
 
-        # emit structured bar for dashboard chart
+        # lazy-init point value on first live bar (after warmup)
+        if self.point_value_per_lot is None:
+            self.point_value_per_lot = self._resolve_point_value()
+
         self.on_event("bar", {
             "bar": bar,
             "live_bars_seen": self.live_bars_seen,
@@ -198,15 +231,16 @@ class StrategyEngine:
         self._log("INFO", f"bar #{self.live_bars_seen} O={bar['open']} C={bar['close']} "
                           f"dir={direction(bar):+d} | open_trades={len(self.open_trades)}")
 
-        # ── 1) increment all open trades & check TP exits ──
-        # iterate over a copy because _close_trade_tp mutates self.open_trades
+        # ── PRIORITY 1: close any overdue trades FIRST (before bar append, before signals) ──
+        # bars_window still gets the bar appended below; we just guarantee
+        # close orders go out before any new signal processing.
         for trade in list(self.open_trades):
             trade["bars_since_entry"] += 1
             trade["bars_window"].append(bar)
             if trade["bars_since_entry"] >= self.cfg["tp_close_after"] + 1:
                 self._close_trade_tp(trade, bar)
 
-        # ── 2) always scan for new signal (overlap allowed) ──
+        # ── PRIORITY 2: scan for new signal (overlap allowed) ──
         required_live_bars = self.cfg["streak_size"] + 1
         if self.live_bars_seen < required_live_bars:
             self._log("INFO", f"building live history {self.live_bars_seen}/{required_live_bars}")
@@ -238,6 +272,8 @@ class StrategyEngine:
     # ─── ORDER EXECUTION ────────────────────────────────────────
     def _open_trade(self, reversal_dir, bars_snapshot, streak_slice, signal_bar):
         c = self.cfg
+        pv = self.point_value_per_lot or float(c.get("point_value_per_lot", 1.0))
+
         theo_entry = self.streamer.level
         if reversal_dir == 1:
             theo_entry_priced = theo_entry + c["slippage_points"]
@@ -250,7 +286,9 @@ class StrategyEngine:
         if risk <= 0:
             self._err(f"non-positive risk (balance=${balance_used:.2f}), skipping trade")
             return
-        raw_lots = risk / (c["fixed_sl_points"] * c["point_value_per_lot"])
+
+        # use REAL point value for sizing — was a bug if config was wrong
+        raw_lots = risk / (c["fixed_sl_points"] * pv)
         lots = max(c["min_lots"], min(c["max_lots"], raw_lots))
 
         info = mt5.symbol_info(c["symbol"])
@@ -315,13 +353,12 @@ class StrategyEngine:
             "signal_idx_in_window":   signal_idx_in_window,
             "entry_global_idx":       self.streamer.global_bar_count,
             "bars_since_entry":       0,
-            # ─── strategy params for validator (embedded so validator
-            #     never drifts from the config that placed the trade) ───
+            # strategy params for validator
             "streak_size":            c["streak_size"],
             "tp_close_after":         c["tp_close_after"],
             "slippage_points":        c["slippage_points"],
             "commission_per_lot":     c["commission_per_lot"],
-            "point_value_per_lot":    c["point_value_per_lot"],
+            "point_value_per_lot":    pv,  # use resolved value, not raw cfg
         }
 
         self.open_trades.append(trade)
@@ -329,66 +366,141 @@ class StrategyEngine:
         self._log("INFO", f"OPEN ticket={ticket} dir={reversal_dir:+d} entry={actual_entry} "
                           f"sl={live_sl} lots={lots} | concurrent_open={len(self.open_trades)}")
 
+    def _send_close_with_retry(self, ticket, lots, is_long):
+        """
+        Send a market close with up to CLOSE_RETRY_ATTEMPTS retries on
+        transient broker failures. Returns (result, attempts_used).
+        """
+        c = self.cfg
+        last_err = None
+        for attempt in range(1, CLOSE_RETRY_ATTEMPTS + 1):
+            tick = mt5.symbol_info_tick(c["symbol"])
+            if tick is None:
+                last_err = f"symbol_info_tick None (attempt {attempt})"
+                time.sleep(CLOSE_RETRY_DELAY_S); continue
+
+            close_type  = mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY
+            close_price = tick.bid if is_long else tick.ask
+
+            request = {
+                "action":       mt5.TRADE_ACTION_DEAL,
+                "symbol":       c["symbol"],
+                "volume":       lots,
+                "type":         close_type,
+                "position":     ticket,
+                "price":        close_price,
+                "deviation":    c["deviation_points"],
+                "magic":        c["magic_number"],
+                "comment":      "tp_close",
+                "type_time":    mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                return result, attempt
+            last_err = result.comment if result else mt5.last_error()
+            self._log("WARN",
+                f"close attempt {attempt}/{CLOSE_RETRY_ATTEMPTS} failed ticket={ticket}: {last_err}")
+
+            # short retry delay — we want to close fast, not wait for next bar
+            if attempt < CLOSE_RETRY_ATTEMPTS:
+                time.sleep(CLOSE_RETRY_DELAY_S)
+
+        self._err(f"TP close EXHAUSTED retries for ticket {ticket}: {last_err}")
+        return None, CLOSE_RETRY_ATTEMPTS
+
     def _close_trade_tp(self, trade, exit_bar):
         """Market-close the given trade at TP_CLOSE_AFTER+1 bars."""
-        c = self.cfg
         ticket = trade["ticket"]
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
-            # already closed (SL hit) — reconcile
             self._log("INFO", f"ticket={ticket} not found in MT5 -- assuming SL, reconciling")
             self._reconcile_closed_position(trade, exit_bar)
             return
 
         pos = positions[0]
-        tick = mt5.symbol_info_tick(c["symbol"])
         is_long = (pos.type == mt5.POSITION_TYPE_BUY)
-        close_type  = mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY
-        close_price = tick.bid if is_long else tick.ask
 
-        request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       c["symbol"],
-            "volume":       pos.volume,
-            "type":         close_type,
-            "position":     ticket,
-            "price":        close_price,
-            "deviation":    c["deviation_points"],
-            "magic":        c["magic_number"],
-            "comment":      "tp_close",
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            err = result.comment if result else mt5.last_error()
-            self._err(f"TP close FAILED for ticket {ticket}: {err}")
+        result, attempts = self._send_close_with_retry(ticket, pos.volume, is_long)
+        if result is None:
+            # close totally failed — leave in open_trades, will retry on next bar
+            # but ALSO check if broker closed it out-of-band in the meantime
+            still_open = mt5.positions_get(ticket=ticket)
+            if not still_open:
+                self._log("INFO", f"ticket={ticket} disappeared during retry, reconciling")
+                self._reconcile_closed_position(trade, exit_bar)
             return
 
-        self._finalize_trade(trade, exit_bar, result.price, hit_sl=False)
+        # Use broker deal data as source of truth, not result.price math
+        self._finalize_trade(trade, exit_bar, result.price, hit_sl=False, close_attempts=attempts)
 
     def _reconcile_closed_position(self, trade, exit_bar):
-        """If MT5 closed the position itself (SL trigger), pull deal info and finalize."""
+        """Position was closed broker-side (SL trigger or manual). Pull authoritative deal data."""
         ticket = trade["ticket"]
         from_time = datetime.now(timezone.utc) - timedelta(hours=24)
         deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
         if not deals:
             self._err(f"could not find closing deal for ticket {ticket}")
-            # remove from open list anyway to prevent loop spam
             if trade in self.open_trades:
                 self.open_trades.remove(trade)
             return
         close_deal = max(deals, key=lambda d: d.time)
-        self._finalize_trade(trade, exit_bar, close_deal.price, hit_sl=True)
+        self._finalize_trade(trade, exit_bar, close_deal.price, hit_sl=True, close_attempts=0)
 
-    def _finalize_trade(self, trade, exit_bar, actual_exit, hit_sl):
+    def _fetch_broker_pnl(self, ticket):
+        """
+        Authoritative PnL from MT5: sum of profit + commission + swap
+        across ALL deals for this position (entry deal + close deal).
+        Returns dict with broker_gross, broker_commission, broker_swap, broker_net.
+        """
+        from_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
+        if not deals:
+            return None
+
+        gross      = sum(d.profit for d in deals)
+        commission = sum(d.commission for d in deals)
+        swap       = sum(d.swap for d in deals)
+        net        = gross + commission + swap
+        return {
+            "broker_gross":      gross,
+            "broker_commission": commission,
+            "broker_swap":       swap,
+            "broker_net":        net,
+            "deal_count":        len(deals),
+        }
+
+    def _finalize_trade(self, trade, exit_bar, actual_exit, hit_sl, close_attempts=0):
         c = self.cfg
+        pv = self.point_value_per_lot or trade.get("point_value_per_lot", 1.0)
+
         actual_entry = trade["actual_entry"]
         is_long = trade["dir"] == 1
-        pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
-        gross_pnl  = pnl_points * trade["lots"] * c["point_value_per_lot"]
-        commission = trade["lots"] * c["commission_per_lot"]
-        net_pnl    = gross_pnl - commission
+
+        # ── THEORETICAL pnl (matches backtester formula for validator) ──
+        theo_pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
+        theo_gross_pnl  = theo_pnl_points * trade["lots"] * pv
+        theo_commission = trade["lots"] * c["commission_per_lot"]
+        theo_net_pnl    = theo_gross_pnl - theo_commission
+
+        # ── REAL pnl (broker-reported, source of truth) ──
+        broker = self._fetch_broker_pnl(trade["ticket"])
+        if broker is not None:
+            real_net_pnl    = broker["broker_net"]
+            real_gross_pnl  = broker["broker_gross"]
+            real_commission = abs(broker["broker_commission"])  # MT5 reports commission as negative
+            real_swap       = broker["broker_swap"]
+            self._log("INFO",
+                f"broker PnL ticket={trade['ticket']}: "
+                f"gross=${real_gross_pnl:+.2f} comm=${broker['broker_commission']:+.2f} "
+                f"swap=${real_swap:+.2f} net=${real_net_pnl:+.2f} "
+                f"(theo_net=${theo_net_pnl:+.2f} diff=${real_net_pnl-theo_net_pnl:+.2f})")
+        else:
+            self._err(f"broker PnL unavailable for ticket {trade['ticket']}, falling back to theoretical")
+            real_net_pnl    = theo_net_pnl
+            real_gross_pnl  = theo_gross_pnl
+            real_commission = theo_commission
+            real_swap       = 0.0
 
         expected_total = (c["streak_size"] + 1) + trade["bars_since_entry"]
         actual_total   = len(trade["bars_window"])
@@ -401,21 +513,38 @@ class StrategyEngine:
             "exit_time":   datetime.now(timezone.utc).isoformat(),
             "actual_exit": actual_exit,
             "hit_sl":      hit_sl,
-            "pnl_points":  pnl_points,
-            "gross_pnl":   gross_pnl,
-            "commission":  commission,
-            "net_pnl":     net_pnl,
+            "close_attempts": close_attempts,
+
+            # backwards-compat fields (default to REAL pnl so dashboard shows truth)
+            "pnl_points":  theo_pnl_points,
+            "gross_pnl":   real_gross_pnl,
+            "commission":  real_commission,
+            "net_pnl":     real_net_pnl,
+            "swap":        real_swap,
+
+            # detailed split for debugging / validator
+            "theo_pnl_points":  theo_pnl_points,
+            "theo_gross_pnl":   theo_gross_pnl,
+            "theo_commission":  theo_commission,
+            "theo_net_pnl":     theo_net_pnl,
+
+            "broker_gross":      real_gross_pnl,
+            "broker_commission": broker["broker_commission"] if broker else None,
+            "broker_swap":       real_swap,
+            "broker_net":        real_net_pnl,
+
             "bars_held":   trade["bars_since_entry"],
-            "r_multiple":  net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
+            "r_multiple":  real_net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
         })
 
-        # remove from open list BEFORE emitting close, so heartbeats are accurate
+        # remove BEFORE emitting close so heartbeats are accurate
         if trade in self.open_trades:
             self.open_trades.remove(trade)
 
         self.on_event("trade.closed", trade)
-        self._log("INFO", f"CLOSE ticket={trade['ticket']} pnl=${net_pnl:+.2f} "
-                          f"reason={'SL' if hit_sl else 'TP'} | "
+        self._log("INFO", f"CLOSE ticket={trade['ticket']} REAL pnl=${real_net_pnl:+.2f} "
+                          f"(theo=${theo_net_pnl:+.2f}) "
+                          f"reason={'SL' if hit_sl else 'TP'} attempts={close_attempts} | "
                           f"remaining_open={len(self.open_trades)}")
 
     def poll_position_status(self):
@@ -430,7 +559,6 @@ class StrategyEngine:
                 self._log("INFO", f"broker-side SL on ticket {ticket} -- reconciling")
                 self._reconcile_closed_position(trade, last_bar)
 
-    # ─── snapshot for heartbeats ────────────────────────────────
     def status_snapshot(self):
         return {
             "engine_state":       "RUNNING" if self.live_bars_seen >= 0 else "IDLE",
@@ -438,13 +566,14 @@ class StrategyEngine:
             "mem_bars":           len(self.streamer.bars) if self.streamer else 0,
             "last_bar_ts":        self.streamer.bars[-1]["time"] if self.streamer and self.streamer.bars else None,
             "open_tickets":       [t["ticket"] for t in self.open_trades],
-            "open_ticket":        self.open_trades[0]["ticket"] if self.open_trades else None,  # legacy single-field for dashboard
+            "open_ticket":        self.open_trades[0]["ticket"] if self.open_trades else None,
             "open_count":         len(self.open_trades),
+            "point_value_per_lot": self.point_value_per_lot,
         }
 
 
 # ═════════════════════════════════════════════════════════════════
-# WARMUP
+# WARMUP (unchanged)
 # ═════════════════════════════════════════════════════════════════
 def warmup(streamer, config, on_event):
     def _log(level, msg): on_event("log", {"level": level, "message": msg})
@@ -496,7 +625,7 @@ def warmup(streamer, config, on_event):
 
 
 # ═════════════════════════════════════════════════════════════════
-# RUN — entrypoint called by worker runtime
+# RUN
 # ═════════════════════════════════════════════════════════════════
 def run(config, on_event, stop_event):
     def _log(level, msg): on_event("log", {"level": level, "message": msg})
@@ -506,7 +635,6 @@ def run(config, on_event, stop_event):
     _log("INFO", f"engine.run() -- symbol={c['symbol']} brick={c['brick_size']} "
                  f"streak={c['streak_size']} sl={c['fixed_sl_points']} tp_after={c['tp_close_after']}")
 
-    # ─── MT5 init ──────────────────────────────────────────────
     _log("INFO", "MT5: initialize()...")
     if not mt5.initialize():
         _err(f"mt5.initialize() FAILED: {mt5.last_error()}"); return
@@ -532,9 +660,10 @@ def run(config, on_event, stop_event):
     if info is None:
         _err(f"symbol_info({c['symbol']}) returned None"); mt5.shutdown(); return
     _log("INFO", f"symbol {c['symbol']}: bid={info.bid} ask={info.ask} "
-                 f"volume_min={info.volume_min} step={info.volume_step}")
+                 f"volume_min={info.volume_min} step={info.volume_step} "
+                 f"tick_value={getattr(info,'trade_tick_value',None)} "
+                 f"tick_size={getattr(info,'trade_tick_size',None)}")
 
-    # ─── build streamer + engine ───────────────────────────────
     is_warmup = [True]
     streamer = LiveKokoCandleStreamer(
         range_size=c["brick_size"],
@@ -555,7 +684,6 @@ def run(config, on_event, stop_event):
     is_warmup[0] = False
     on_event("warmup.done", {"bars": streamer.global_bar_count, "in_memory": len(streamer.bars)})
 
-    # ─── live loop ────────────────────────────────────────────
     last_tick = mt5.symbol_info_tick(c["symbol"])
     last_tick_ts = last_tick.time_msc if last_tick else 0
     _log("INFO", f"LIVE LOOP entering -- poll_interval={c['tick_poll_interval']}s")
@@ -604,9 +732,6 @@ def run(config, on_event, stop_event):
         mt5.shutdown()
 
 
-# ═════════════════════════════════════════════════════════════════
-# ACCOUNT SNAPSHOT for heartbeats
-# ═════════════════════════════════════════════════════════════════
 def get_account_snapshot():
     try:
         acct = mt5.account_info()

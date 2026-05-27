@@ -1,9 +1,15 @@
 """
 validator.py — Backtest re-runner / trade validator.
 
-For each closed live trade, takes the captured bars and re-runs the EXACT
-same strategy logic (matching the original Python backtester). Compares
+For each closed live trade, takes the captured bars (bars_window) and re-runs
+the EXACT same strategy logic as the original Python backtester. Compares
 expected vs actual entry/exit/PnL and returns a verdict.
+
+OVERLAPPING TRADES:
+  Each live trade carries its own self-contained `bars_window` (streak +
+  signal + walk-forward bars). Validation is done per-trade in isolation,
+  so concurrent/overlapping trades are naturally handled — each one is
+  re-simulated against the bars it actually saw, with no cross-contamination.
 
 Can also be run standalone:  python validator.py
 """
@@ -12,16 +18,16 @@ import json
 import os
 
 # ─── MUST MATCH live_engine.py ───────────────────────────────────
-STREAK_SIZE        = 3
+STREAK_SIZE        = 2       # ← matches live_engine.py
 TP_CLOSE_AFTER     = 3
 FIXED_SL_POINTS    = 16.0
 SLIPPAGE_POINTS    = 0.3
 COMMISSION_PER_LOT = 0.8
 
 # tolerances for "match"
-PRICE_TOL_PTS      = 2.0     # entry/exit price tolerance
+PRICE_TOL_PTS      = 2.0     # entry/exit price tolerance (points)
 PNL_TOL_DOLLARS    = 2.0     # absolute $ tolerance
-PNL_TOL_PCT        = 10.0    # OR % tolerance, whichever bigger
+PNL_TOL_PCT        = 10.0    # OR % tolerance — flags if EITHER exceeded
 # ─────────────────────────────────────────────────────────────────
 
 TRADE_LOG = "trades_log.json"
@@ -45,8 +51,8 @@ def simulate_trade(bars, signal_idx, lots):
 
     Tolerates partial walk-forward (e.g., SL hit before all TP bars elapsed).
     """
-    # ─── diagnostic ───
-    diag = f"len(bars)={len(bars)} signal_idx={signal_idx} STREAK_SIZE={STREAK_SIZE} TP_AFTER={TP_CLOSE_AFTER}"
+    diag = (f"len(bars)={len(bars)} signal_idx={signal_idx} "
+            f"STREAK_SIZE={STREAK_SIZE} TP_AFTER={TP_CLOSE_AFTER}")
 
     # ─── validate streak ───
     if signal_idx < STREAK_SIZE:
@@ -67,7 +73,7 @@ def simulate_trade(bars, signal_idx, lots):
     if entry_idx >= len(bars):
         return {"ok": False, "reason": f"no entry bar ({diag})"}
 
-    # tp_idx might exceed available walk-forward bars if SL hit early — that's fine, we cap it
+    # tp_idx might exceed available walk-forward bars if SL hit early — cap it
     tp_idx_ideal = entry_idx + TP_CLOSE_AFTER
     tp_idx = min(tp_idx_ideal, len(bars) - 1)
     walk_truncated = tp_idx < tp_idx_ideal
@@ -81,7 +87,7 @@ def simulate_trade(bars, signal_idx, lots):
         entry_price = raw_entry - SLIPPAGE_POINTS
         sl_price    = entry_price + FIXED_SL_POINTS
 
-    # ─── walk forward ───
+    # ─── walk forward (intrabar SL, exact match w/ backtester) ───
     hit_sl = False
     exit_price = None
     exit_idx = None
@@ -104,7 +110,7 @@ def simulate_trade(bars, signal_idx, lots):
 
     if not hit_sl:
         if walk_truncated:
-            # walk-forward was cut short (live SL fired before full window).
+            # walk-forward was cut short (live SL fired before full window emitted).
             # Can't simulate a TP exit — mark as inconclusive.
             return {"ok": False, "reason": f"walk-forward truncated, can't simulate TP ({diag})"}
         raw_tp = bars[tp_idx]["close"]
@@ -137,6 +143,9 @@ def validate_trade(record):
     record = single trade dict written by live_engine.py
     contains the bars window + actual fills.
     Returns verdict dict.
+
+    Each trade is validated in isolation against its own captured bars_window,
+    so overlapping/concurrent trades don't interfere with each other.
     """
     bars       = record["bars_window"]
     signal_idx = record["signal_idx_in_window"]
@@ -168,10 +177,15 @@ def validate_trade(record):
         reasons.append(f"entry_off_{entry_diff:.2f}pt")
     if exit_diff > PRICE_TOL_PTS:
         reasons.append(f"exit_off_{exit_diff:.2f}pt")
-    if abs(pnl_diff) > PNL_TOL_DOLLARS and abs(pnl_diff_pct) > PNL_TOL_PCT:
-        reasons.append(f"pnl_off_${pnl_diff:+.2f}")
+    # OR logic — flag if EITHER absolute OR relative drift exceeds threshold
+    if abs(pnl_diff) > PNL_TOL_DOLLARS or abs(pnl_diff_pct) > PNL_TOL_PCT:
+        reasons.append(f"pnl_off_${pnl_diff:+.2f} ({pnl_diff_pct:+.1f}%)")
     if record["hit_sl"] != sim["hit_sl"]:
-        reasons.append(f"exit_reason_mismatch (live={'SL' if record['hit_sl'] else 'TP'}, sim={'SL' if sim['hit_sl'] else 'TP'})")
+        reasons.append(
+            f"exit_reason_mismatch ("
+            f"live={'SL' if record['hit_sl'] else 'TP'}, "
+            f"sim={'SL' if sim['hit_sl'] else 'TP'})"
+        )
 
     return {
         "match": len(reasons) == 0,
@@ -196,18 +210,47 @@ def _run_standalone():
 
     matches = 0
     mismatches = 0
+    total_actual_pnl = 0.0
+    total_expected_pnl = 0.0
+
+    print(f"\n{'─'*80}")
+    print(f" VALIDATOR  |  STREAK={STREAK_SIZE} TP={TP_CLOSE_AFTER} "
+          f"SL={FIXED_SL_POINTS}pt SLIP={SLIPPAGE_POINTS}pt COMM=${COMMISSION_PER_LOT}/lot")
+    print(f"{'─'*80}\n")
+
     for i, rec in enumerate(log):
         if rec.get("status") != "closed":
             continue
         v = validate_trade(rec)
-        tag = "✅ MATCH" if v["match"] else "⚠️ MISMATCH"
-        print(f"#{i+1:>3} {tag}  actual=${rec['net_pnl']:+.2f}  "
-              f"expected=${v['expected_pnl']:+.2f}  diff=${v['pnl_diff']:+.2f}  "
-              f"({v['reason']})")
-        if v["match"]: matches += 1
-        else:          mismatches += 1
+        tag = "✅ MATCH   " if v["match"] else "⚠️  MISMATCH"
+        print(f"#{i+1:>3} {tag}  actual=${rec['net_pnl']:+8.2f}  "
+              f"expected=${v['expected_pnl']:+8.2f}  "
+              f"diff=${v['pnl_diff']:+7.2f}  ({v['reason']})")
+        if v["match"]:
+            matches += 1
+        else:
+            mismatches += 1
+        total_actual_pnl   += rec['net_pnl']
+        total_expected_pnl += v['expected_pnl']
 
-    print(f"\nTotal: {matches} match / {mismatches} mismatch")
+    total = matches + mismatches
+    if total == 0:
+        print("no closed trades to validate")
+        return
+
+    match_pct = (matches / total) * 100.0
+    pnl_drift = total_actual_pnl - total_expected_pnl
+
+    print(f"\n{'─'*80}")
+    print(f" SUMMARY")
+    print(f"{'─'*80}")
+    print(f"  Total closed trades : {total}")
+    print(f"  Matches             : {matches} ({match_pct:.1f}%)")
+    print(f"  Mismatches          : {mismatches}")
+    print(f"  Total actual PnL    : ${total_actual_pnl:+.2f}")
+    print(f"  Total expected PnL  : ${total_expected_pnl:+.2f}")
+    print(f"  Cumulative drift    : ${pnl_drift:+.2f}")
+    print(f"{'─'*80}\n")
 
 
 if __name__ == "__main__":

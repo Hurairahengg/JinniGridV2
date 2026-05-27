@@ -1,13 +1,4 @@
-"""
-live_engine.py — Live execution for the 2-streak / 3-TP / 16pt-SL strategy.
 
-- Symbol:   USTEC
-- Bars:     8pt Koko (grid-anchored range bars), rev_bricks=2, clean_mode=OFF
-- Strategy: streak_size=2, tp_close_after=3, FIXED_SL=16pt
-- Warmup:   100 bars from MT5 tick history
-- Memory:   max 100 bars in RAM at all times
-- Match:    1:1 with backtester INCLUDING overlapping trades (i+=1 behavior)
-"""
 
 import os
 import json
