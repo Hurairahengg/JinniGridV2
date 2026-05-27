@@ -1,9 +1,13 @@
-// ═══ JINNI GRID — Mission Control ═══
+// ═══════════════════════════════════════════════════════════
+// JINNI GRID — Mission Control v0.2
+// ═══════════════════════════════════════════════════════════
 
 const state = {
   workers: [], activePage: "home", feedItems: [],
   chartWorker: null, chart: null, candleSeries: null,
   chartBars: [], chartMarkers: [], ws: null,
+  dbTable: null, dbOffset: 0, dbLimit: 50,
+  liveAcct: { balance: 0, equity: 0, floating: 0 },
 };
 
 const $  = sel => document.querySelector(sel);
@@ -11,27 +15,26 @@ const $$ = sel => Array.from(document.querySelectorAll(sel));
 
 const api = {
   get:  u    => fetch(u).then(r => r.json()),
-  post: u    => fetch(u, {method:"POST"}).then(r => r.json()),
-  put:  (u,b)=> fetch(u, {method:"PUT", headers:{"Content-Type":"application/json"},
-                          body: JSON.stringify(b)}).then(r => r.json()),
+  post: (u,b)=> fetch(u, {method:"POST", headers:{"Content-Type":"application/json"}, body: b?JSON.stringify(b):undefined}).then(r => r.json()),
+  put:  (u,b)=> fetch(u, {method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(b)}).then(r => r.json()),
+  del:  u    => fetch(u, {method:"DELETE"}).then(r => r.json()),
 };
 
 const fmt = {
-  money: v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Number(v).toFixed(2),
+  money: v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Math.abs(Number(v)).toFixed(2),
+  big:   v => v == null ? "$0" : (v >= 0 ? "" : "-") + "$" + Math.abs(Number(v)).toLocaleString("en-US", {maximumFractionDigits: 0}),
   num:   (v,d=2) => v == null ? "—" : Number(v).toFixed(d),
   pct:   v => v == null ? "—" : Number(v).toFixed(1) + "%",
-  time:  v => v ? new Date(v).toLocaleTimeString("en-GB", {hour12:false}) : "—",
   short: v => v ? new Date(v).toLocaleTimeString("en-GB", {hour12:false}).slice(0,8) : "—",
-  big:   v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Number(v).toLocaleString("en-US", {maximumFractionDigits: 2}),
 };
+
+const escapeHtml = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 // ═══ THEME ═══
 const THEME_KEY = "jg-theme", ACCENT_KEY = "jg-accent", DENSITY_KEY = "jg-density";
-
 function applyTheme(name)   { document.documentElement.setAttribute("data-theme", name);  localStorage.setItem(THEME_KEY, name);   refreshChartThemes(); }
 function applyAccent(name)  { document.documentElement.setAttribute("data-accent", name); localStorage.setItem(ACCENT_KEY, name);  refreshChartThemes(); }
 function applyDensity(name) { document.documentElement.setAttribute("data-density", name); localStorage.setItem(DENSITY_KEY, name); }
-
 applyTheme  (localStorage.getItem(THEME_KEY)  || "midnight");
 applyDensity(localStorage.getItem(DENSITY_KEY) || "normal");
 const savedAccent = localStorage.getItem(ACCENT_KEY); if (savedAccent) applyAccent(savedAccent);
@@ -39,12 +42,11 @@ const savedAccent = localStorage.getItem(ACCENT_KEY); if (savedAccent) applyAcce
 const themePanel = $("#theme-panel");
 $("#theme-btn").onclick = e => { e.stopPropagation(); themePanel.classList.toggle("hidden"); markActiveTheme(); };
 document.addEventListener("click", e => {
-  if (!themePanel.contains(e.target) && e.target.id !== "theme-btn") themePanel.classList.add("hidden");
+  if (!themePanel.contains(e.target) && e.target.id !== "theme-btn" && !e.target.closest("#theme-btn")) themePanel.classList.add("hidden");
 });
 $$(".theme-swatch").forEach(b => b.onclick = () => { applyTheme(b.dataset.theme); markActiveTheme(); });
 $$(".accent-dot")  .forEach(b => b.onclick = () => { applyAccent(b.dataset.accent); markActiveTheme(); });
 $$(".density-btn") .forEach(b => b.onclick = () => { applyDensity(b.dataset.density); markActiveTheme(); });
-
 function markActiveTheme() {
   const t = document.documentElement.dataset.theme;
   const a = document.documentElement.dataset.accent || "";
@@ -56,17 +58,24 @@ function markActiveTheme() {
 
 function refreshChartThemes() {
   setTimeout(() => {
-    if (equityChart) equityChart.applyOptions(chartBaseOpts($("#equity-chart")));
-    if (portEquityChart) portEquityChart.applyOptions(chartBaseOpts($("#port-equity")));
+    if (liveAccountChart) liveAccountChart.applyOptions(chartBaseOpts($("#live-account-chart")));
+    if (portEquityChart) portEquityChart.applyOptions(chartBaseOpts($("#port-equity-chart")));
     if (portDdChart) portDdChart.applyOptions(chartBaseOpts($("#port-dd")));
     if (portHistChart) portHistChart.applyOptions(chartBaseOpts($("#port-hist")));
     if (state.chart) state.chart.applyOptions(chartBaseOpts($("#live-chart")));
   }, 30);
 }
 
-// ═══ NAV ═══
-$$(".nav-item").forEach(btn => btn.onclick = () => navigate(btn.dataset.page));
+// ═══ MOBILE NAV ═══
+const sidebar = $("#sidebar");
+const backdrop = $("#mobile-backdrop");
+function openNav()  { sidebar.classList.add("open"); backdrop.classList.remove("hidden"); }
+function closeNav() { sidebar.classList.remove("open"); backdrop.classList.add("hidden"); }
+$("#nav-toggle").onclick = () => sidebar.classList.contains("open") ? closeNav() : openNav();
+backdrop.onclick = closeNav;
 
+// ═══ NAV ═══
+$$(".nav-item").forEach(btn => btn.onclick = () => { navigate(btn.dataset.page); closeNav(); });
 function navigate(page) {
   state.activePage = page;
   $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
@@ -75,7 +84,7 @@ function navigate(page) {
   if (page === "portfolio") loadPortfolio();
   if (page === "fleet")     loadFleet();
   if (page === "logs")      loadLogs();
-  if (page === "config")    loadConfigList();
+  if (page === "config")    initSettings();
   if (page === "charts")    initChartsPage();
 }
 
@@ -88,20 +97,32 @@ function connectWS() {
   const ws = new WebSocket(`${proto}://${location.host}/ws/ui`);
   state.ws = ws;
   ws.onopen  = () => { $("#conn-pill").classList.remove("off"); $("#conn-text").textContent = "live"; };
-  ws.onclose = () => { $("#conn-pill").classList.add("off");    $("#conn-text").textContent = "reconnecting"; setTimeout(connectWS, 2000); };
+  ws.onclose = () => { $("#conn-pill").classList.add("off"); $("#conn-text").textContent = "reconnecting"; setTimeout(connectWS, 2000); };
   ws.onmessage = e => handleWS(JSON.parse(e.data));
 }
 
 function handleWS(msg) {
   const t = msg.type;
-  if (t === "heartbeat" || t === "worker.update") {
-    if (state.activePage === "home")  loadHome();
-    if (state.activePage === "fleet") loadFleet({silent:true});
+  if (t === "heartbeat") {
+    // live balance/equity refresh — every 5s per worker
+    refreshLiveTopline();
+    if (state.activePage === "home") {
+      updateLiveAccountChart();
+      refreshOpenPositions();
+    }
+    if (state.activePage === "portfolio") refreshPortfolioLive();
+    if (state.activePage === "fleet")     loadFleet({silent:true});
     if (state.activePage === "charts" && msg.worker_id === state.chartWorker) updateSideFromHB(msg.payload);
   }
+  if (t === "worker.update") {
+    if (state.activePage === "home" || state.activePage === "fleet") loadFleet({silent:true});
+    refreshLiveTopline();
+  }
   if (t === "trade.opened") {
-    pushFeed("trade-opened", msg.worker_id, `OPEN ${msg.payload.dir === 1 ? "▲ LONG" : "▼ SHORT"} ${msg.payload.symbol} @ ${fmt.num(msg.payload.actual_entry)}`);
-    if (state.activePage === "home")      loadHome();
+    pushFeed("trade-opened", msg.worker_id,
+      `OPEN ${msg.payload.dir === 1 ? "▲ LONG" : "▼ SHORT"} ${msg.payload.symbol} @ ${fmt.num(msg.payload.actual_entry)}`);
+    flashKpi("kpi-floating");
+    if (state.activePage === "home") refreshOpenPositions();
     if (state.activePage === "portfolio") loadPortfolio();
     if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartMarker(msg.payload, "open"); pushFill(msg.payload, "open"); }
     toast("info", `${msg.worker_id}: trade opened`);
@@ -110,14 +131,63 @@ function handleWS(msg) {
     const p = msg.payload;
     const cls = (p.net_pnl || 0) >= 0 ? "trade-closed-win" : "trade-closed-loss";
     pushFeed(cls, msg.worker_id, `CLOSE ${p.symbol} · ${fmt.money(p.net_pnl)} · ${p.hit_sl ? "SL" : "TP"}`);
-    if (state.activePage === "home")      loadHome();
-    if (state.activePage === "portfolio") loadPortfolio();
+    flashKpi("kpi-pnl", p.net_pnl >= 0);
+    if (state.activePage === "home")      { loadHome(); }
+    if (state.activePage === "portfolio") { loadPortfolio(); }
     if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartMarker(p, "close"); pushFill(p, "close"); }
     toast(p.net_pnl >= 0 ? "success" : "error", `${msg.worker_id}: ${fmt.money(p.net_pnl)}`);
   }
   if (t === "log")   { if (state.activePage === "logs") appendLogLive(msg); }
   if (t === "error") { pushFeed("error", msg.worker_id, msg.payload.message); toast("error", `[${msg.worker_id}] ${msg.payload.message}`); }
   if (t === "bar")   { if (state.activePage === "charts" && msg.worker_id === state.chartWorker) { addChartBar(msg.payload.bar); updateSideFromBar(msg.payload); } }
+}
+
+// ═══ LIVE TOPLINE ═══
+async function refreshLiveTopline() {
+  try {
+    const live = await api.get("/api/equity_live");
+    state.liveAcct.balance = live.total_balance;
+    state.liveAcct.equity  = live.total_equity;
+    state.liveAcct.floating = live.total_floating;
+    paintTopline();
+  } catch (e) { /* ignore */ }
+}
+function paintTopline() {
+  const eq = state.liveAcct.equity;
+  const fl = state.liveAcct.floating;
+  $("#hdr-equity").textContent = fmt.big(eq);
+  const fEl = $("#hdr-floating");
+  fEl.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+  fEl.classList.toggle("pos", fl > 0);
+  fEl.classList.toggle("neg", fl < 0);
+  // home cells
+  const balEl = $("#kpi-balance"); if (balEl) balEl.querySelector(".kc-value").textContent = fmt.big(state.liveAcct.balance);
+  const eqEl  = $("#kpi-equity");  if (eqEl)  eqEl.querySelector(".kc-value").textContent = fmt.big(eq);
+  const flEl  = $("#kpi-floating");
+  if (flEl) {
+    const v = flEl.querySelector(".kc-value");
+    v.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+    v.classList.toggle("positive", fl > 0);
+    v.classList.toggle("negative", fl < 0);
+  }
+  // portfolio cells
+  const pb = $("#port-balance");  if (pb) pb.querySelector(".kc-value").textContent = fmt.big(state.liveAcct.balance);
+  const pe = $("#port-equity");   if (pe) pe.querySelector(".kc-value").textContent = fmt.big(eq);
+  const pf = $("#port-floating");
+  if (pf) {
+    const v = pf.querySelector(".kc-value");
+    v.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+    v.classList.toggle("positive", fl > 0);
+    v.classList.toggle("negative", fl < 0);
+  }
+}
+function flashKpi(id, pos = null) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove("flash-green", "flash-red");
+  void el.offsetWidth;
+  if (pos === true || pos === null) el.classList.add("flash-green");
+  else el.classList.add("flash-red");
 }
 
 // ═══ FEED ═══
@@ -131,11 +201,8 @@ function renderFeed() {
   el.innerHTML = state.feedItems.map(i => `
     <div class="feed-item ${i.cls}">
       <span class="feed-time">${fmt.short(i.ts)}</span>
-      <div class="feed-body"><span class="feed-worker">${i.worker || "—"}</span>${escapeHtml(i.msg)}</div>
+      <div class="feed-body"><span class="feed-worker">${escapeHtml(i.worker || "—")}</span>${escapeHtml(i.msg)}</div>
     </div>`).join("");
-}
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
 // ═══ TOASTS ═══
@@ -147,13 +214,13 @@ function toast(kind, msg) {
   setTimeout(() => el.remove(), 3600);
 }
 
-// ═══ CHART OPTS (theme-aware) ═══
+// ═══ CHART OPTS ═══
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 function chartBaseOpts(el) {
   return {
     width: el ? el.clientWidth : 600,
     height: el ? el.clientHeight : 300,
-    layout: { background: { color: "transparent" }, textColor: cssVar("--text-2"), fontFamily: "JetBrains Mono" },
+    layout: { background: { color: "transparent" }, textColor: cssVar("--text-2"), fontFamily: "JetBrains Mono", fontSize: 11 },
     grid: { vertLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" }, horzLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" } },
     rightPriceScale: { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)" },
     timeScale:       { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)", timeVisible: true, secondsVisible: false },
@@ -161,53 +228,38 @@ function chartBaseOpts(el) {
   };
 }
 
-// ═══ HOME / MISSION CONTROL (revamped) ═══
-let equityChart = null, equitySeries = null;
-let equityRange = "all";  // all | 100 | 50 | 20
-let equityRaw = [];
+// ═══════════════════════════════════════════════
+// HOME / MISSION CONTROL
+// ═══════════════════════════════════════════════
+let liveAccountChart = null, balanceSeries = null, equitySeries = null;
 
 async function loadHome() {
-  const [workers, portfolio, equity, trades24] = await Promise.all([
+  const [workers, portfolio, trades24, live] = await Promise.all([
     api.get("/api/workers"),
     api.get("/api/portfolio"),
-    api.get("/api/equity"),
     api.get("/api/trades?status=closed&limit=200"),
+    api.get("/api/equity_live"),
   ]);
   state.workers = workers;
-  equityRaw = equity;
+  state.liveAcct = {
+    balance: live.total_balance, equity: live.total_equity, floating: live.total_floating,
+  };
+  paintTopline();
 
-  // ─── KPI: pnl ───
+  // ─── KPI: net pnl ───
   const pnlEl = $("#kpi-pnl");
   const pnlVal = pnlEl.querySelector(".kc-value");
   pnlVal.textContent = fmt.money(portfolio.net_pnl);
   pnlVal.classList.toggle("positive", portfolio.net_pnl > 0);
   pnlVal.classList.toggle("negative", portfolio.net_pnl < 0);
-  $("#kpi-trades").textContent = `${portfolio.n_trades} trades`;
-  // mini spark gradient color
-  $("#kpi-pnl-spark").style.background =
-    portfolio.net_pnl >= 0
-      ? "linear-gradient(180deg, transparent, color-mix(in srgb, var(--success) 18%, transparent))"
-      : "linear-gradient(180deg, transparent, color-mix(in srgb, var(--danger) 18%, transparent))";
-
-  // ─── KPI: win rate ───
-  $("#kpi-wr").querySelector(".kc-value").textContent = fmt.pct(portfolio.win_rate);
-  $("#kpi-wl").textContent = `${portfolio.wins}W / ${portfolio.losses}L`;
-  $("#kpi-wr-bar").style.width = (portfolio.win_rate || 0) + "%";
+  $("#kpi-trades").textContent = `${portfolio.n_trades} trades · ${portfolio.win_rate}% wr`;
 
   // ─── KPI: fleet ───
   const running = workers.filter(w => w.state === "RUNNING").length;
   $("#kpi-fleet").querySelector(".kc-value").textContent = `${running} / ${workers.length}`;
-  $("#kpi-fleet-dots").innerHTML = workers.slice(0, 20).map(w =>
+  $("#kpi-fleet-dots").innerHTML = workers.slice(0, 24).map(w =>
     `<span class="kc-dot ${w.state}" title="${w.id} · ${w.state}"></span>`
   ).join("");
-
-  // ─── KPI: positions ───
-  const positions = workers.reduce((s,w) => s + (w.open_positions || 0), 0);
-  $("#kpi-positions").querySelector(".kc-value").textContent = positions;
-  const openWorkers = workers.filter(w => (w.open_positions || 0) > 0).map(w => w.id);
-  $("#kpi-pos-mini").textContent = openWorkers.length
-    ? openWorkers.slice(0, 3).join(" · ") + (openWorkers.length > 3 ? ` +${openWorkers.length - 3}` : "")
-    : "—";
 
   // ─── header quick stats ───
   const today = todaysPnl(trades24);
@@ -219,22 +271,50 @@ async function loadHome() {
 
   // ─── fleet pulse ───
   $("#fleet-pulse-sub").textContent = `${running} active · ${workers.length} total`;
-  $("#fleet-pulse").innerHTML = workers.map(w => `
-    <div class="pulse-card">
-      <span class="pulse-state ${w.state}"></span>
-      <div class="pulse-info">
-        <div class="pulse-id">${w.id}</div>
-        <div class="pulse-meta">${w.state} · ${w.broker || "no broker"}</div>
-      </div>
-      <div class="pulse-balance">${w.last_balance != null ? "$" + Number(w.last_balance).toFixed(0) : "—"}</div>
-    </div>`).join("") ||
-    `<div style="padding:20px;color:var(--text-3);font-size:11px;text-align:center">no workers registered</div>`;
+  $("#fleet-pulse").innerHTML = workers.map(w => {
+    const fl = (w.last_equity != null && w.last_balance != null) ? (w.last_equity - w.last_balance) : null;
+    return `
+      <div class="pulse-card">
+        <span class="pulse-state ${w.state}"></span>
+        <div class="pulse-info">
+          <div class="pulse-id">${w.id}</div>
+          <div class="pulse-meta">${w.state} · ${w.broker || "no broker"}</div>
+        </div>
+        <div class="pulse-right">
+          <div class="pulse-balance">${w.last_equity != null ? "$" + Number(w.last_equity).toFixed(0) : "—"}</div>
+          ${fl != null ? `<div class="pulse-floating ${fl>=0?"pos":"neg"}">${fl>=0?"+":""}${fl.toFixed(2)}</div>` : ""}
+        </div>
+      </div>`;
+  }).join("") || `<div class="pos-empty">no workers registered</div>`;
 
-  // ─── movers ───
-  renderMovers(portfolio.by_worker || [], trades24);
+  // ─── open positions ───
+  refreshOpenPositions();
 
-  // ─── equity curve ───
-  renderHomeEquity();
+  // ─── live account chart ───
+  renderLiveAccountChart(live.per_worker);
+}
+
+function refreshOpenPositions() {
+  const open = state.workers.filter(w => (w.open_positions || 0) > 0);
+  $("#positions-sub").textContent = `${open.reduce((s,w)=>s+w.open_positions,0)} open`;
+  const el = $("#positions-list");
+  if (!el) return;
+  if (!open.length) {
+    el.innerHTML = `<div class="pos-empty">no open positions</div>`;
+    return;
+  }
+  el.innerHTML = open.map(w => {
+    const fl = (w.last_equity != null && w.last_balance != null) ? (w.last_equity - w.last_balance) : null;
+    return `
+      <div class="pos-row">
+        <div class="pos-meta">
+          <div class="pos-worker">${w.id}</div>
+          <div class="pos-sub">${w.open_positions} position${w.open_positions>1?"s":""} · ${w.broker || ""}</div>
+        </div>
+        <div class="pos-price">${w.last_equity != null ? "$"+Number(w.last_equity).toFixed(2) : "—"}</div>
+        <div>${fl != null ? `<span class="pos-dir ${fl>=0?"LONG":"SHORT"}">${fl>=0?"+":""}${fl.toFixed(2)}</span>` : "—"}</div>
+      </div>`;
+  }).join("");
 }
 
 function todaysPnl(trades) {
@@ -248,116 +328,111 @@ function trades24Count(trades) {
   return trades.filter(t => t.exit_time && new Date(t.exit_time).getTime() >= cutoff).length;
 }
 
-function renderMovers(byWorker, trades24) {
-  const el = $("#movers"); if (!el) return;
-
-  // top + bottom 3 by net pnl
-  const sorted = [...byWorker].sort((a,b) => b.net_pnl - a.net_pnl);
-  const top = sorted.slice(0, 3);
-  const bot = sorted.slice(-3).reverse();
-
-  // recent trades — top 5 by abs pnl in last 24h
-  const cutoff = Date.now() - 24 * 3600 * 1000;
-  const recent = trades24
-    .filter(t => t.exit_time && new Date(t.exit_time).getTime() >= cutoff)
-    .sort((a,b) => Math.abs(b.net_pnl||0) - Math.abs(a.net_pnl||0))
-    .slice(0, 5);
-
-  const rowHtml = (rank, id, val) => `
-    <div class="mover-row">
-      <span class="m-rank">${rank}</span>
-      <span class="m-id">${id}</span>
-      <span class="m-pnl ${val >= 0 ? "pos" : "neg"}">${fmt.money(val)}</span>
-    </div>`;
-
-  let html = "";
-  if (top.length) {
-    html += `<div class="movers-section">▲ top workers</div>`;
-    html += top.map((w,i) => rowHtml(i+1, w.worker_id, w.net_pnl)).join("");
+function buildAggSeries(perWorker) {
+  // align all worker series by timestamp; for missing values, carry-forward last known per worker
+  const all = []; // [{ts: <iso>, perWid: {wid: {bal, eq}}}]
+  const seen = new Map();
+  for (const [wid, arr] of Object.entries(perWorker)) {
+    for (const p of arr) {
+      const t = new Date(p.ts).getTime();
+      if (!seen.has(t)) seen.set(t, {ts: t, per: {}});
+      seen.get(t).per[wid] = {balance: p.balance, equity: p.equity};
+    }
   }
-  if (bot.length && bot[0].net_pnl < 0) {
-    html += `<div class="movers-section">▼ bottom workers</div>`;
-    html += bot.filter(w => w.net_pnl < 0).map((w,i) => rowHtml(i+1, w.worker_id, w.net_pnl)).join("");
+  const sorted = Array.from(seen.values()).sort((a,b)=>a.ts-b.ts);
+  // carry-forward
+  const last = {};
+  const balSeries = [], eqSeries = [];
+  for (const pt of sorted) {
+    for (const [wid, v] of Object.entries(pt.per)) last[wid] = v;
+    let totalBal = 0, totalEq = 0;
+    for (const v of Object.values(last)) { totalBal += v.balance; totalEq += v.equity; }
+    const tSec = Math.floor(pt.ts / 1000);
+    balSeries.push({ time: tSec, value: totalBal });
+    eqSeries.push({  time: tSec, value: totalEq });
   }
-  if (recent.length) {
-    html += `<div class="movers-section">↯ biggest 24h</div>`;
-    html += recent.map((t,i) => rowHtml(i+1, `${t.worker_id} #${t.ticket||"?"}`, t.net_pnl||0)).join("");
+  // dedupe equal timestamps (lightweight-charts strict)
+  function dedupe(arr) {
+    const out = [];
+    let prev = -1;
+    for (const p of arr) {
+      let t = p.time;
+      if (t <= prev) t = prev + 1;
+      out.push({ time: t, value: p.value });
+      prev = t;
+    }
+    return out;
   }
-  el.innerHTML = html || `<div class="movers-empty">no movement yet</div>`;
+  return { bal: dedupe(balSeries), eq: dedupe(eqSeries) };
 }
 
-function renderHomeEquity() {
-  const el = $("#equity-chart"); if (!el) return;
-
-  if (!equityChart) {
-    equityChart = LightweightCharts.createChart(el, {
+function renderLiveAccountChart(perWorker) {
+  const el = $("#live-account-chart");
+  if (!el) return;
+  if (!liveAccountChart) {
+    liveAccountChart = LightweightCharts.createChart(el, {
       ...chartBaseOpts(el),
-      handleScroll: false,
-      handleScale: false,
-      timeScale: {
-        ...chartBaseOpts(el).timeScale,
-        rightOffset: 4, fixLeftEdge: true, fixRightEdge: true,
-        lockVisibleTimeRangeOnResize: true,
-      },
+      handleScroll: false, handleScale: false,
+      timeScale: { ...chartBaseOpts(el).timeScale, rightOffset: 4, fixLeftEdge: true, fixRightEdge: true },
     });
-    equitySeries = equityChart.addAreaSeries({
-      lineColor: cssVar("--accent"),
-      topColor:  "color-mix(in srgb, " + cssVar("--accent") + " 35%, transparent)",
-      bottomColor:"color-mix(in srgb, " + cssVar("--accent") + " 2%, transparent)",
+    balanceSeries = liveAccountChart.addLineSeries({
+      color: cssVar("--accent"), lineWidth: 2,
+      priceLineVisible: false, lastValueVisible: true,
+    });
+    equitySeries = liveAccountChart.addAreaSeries({
+      lineColor: cssVar("--success"),
+      topColor: "color-mix(in srgb, " + cssVar("--success") + " 22%, transparent)",
+      bottomColor: "color-mix(in srgb, " + cssVar("--success") + " 0%, transparent)",
       lineWidth: 2,
-      priceLineVisible: false,
-      lastValueVisible: true,
+      priceLineVisible: false, lastValueVisible: true,
     });
-    new ResizeObserver(() => {
-      equityChart.resize(el.clientWidth, el.clientHeight);
-      equityChart.timeScale().fitContent();
-    }).observe(el);
+    new ResizeObserver(() => { liveAccountChart.resize(el.clientWidth, el.clientHeight); liveAccountChart.timeScale().fitContent(); }).observe(el);
   }
-
-  // slice by selected range
-  let data = equityRaw.slice();
-  if (equityRange !== "all") {
-    const n = parseInt(equityRange, 10);
-    data = data.slice(-n);
+  const { bal, eq } = buildAggSeries(perWorker || {});
+  balanceSeries.setData(bal);
+  equitySeries.setData(eq);
+  if (eq.length) {
+    liveAccountChart.timeScale().fitContent();
+    const last = eq[eq.length - 1];
+    const first = eq[0];
+    const delta = last.value - first.value;
+    $("#equity-meta").innerHTML = `${eq.length} pts · <span style="color:${delta>=0?'var(--success)':'var(--danger)'}">${delta>=0?"+":""}$${delta.toFixed(2)}</span> session`;
+  } else {
+    $("#equity-meta").textContent = "waiting for heartbeats…";
   }
-
-  // use sequential integer "time" so it never drifts even if trade timestamps are weird
-  const points = data.map((e, i) => ({ time: i + 1, value: e.cum }));
-  equitySeries.setData(points);
-  equityChart.timeScale().fitContent();
-
-  // meta line
-  const last = points.length ? points[points.length - 1].value : 0;
-  const first = points.length ? points[0].value : 0;
-  const delta = last - first;
-  $("#equity-meta").innerHTML = points.length
-    ? `${points.length} trades · <span style="color:${delta >= 0 ? "var(--success)" : "var(--danger)"}">${fmt.money(delta)}</span> over range`
-    : "no closed trades yet";
 }
 
-// range selector
-document.addEventListener("click", e => {
-  if (!e.target.classList.contains("seg-btn")) return;
-  if (!e.target.closest(".eq-controls")) return;
-  $$(".eq-controls .seg-btn").forEach(b => b.classList.toggle("active", b === e.target));
-  equityRange = e.target.dataset.range;
-  renderHomeEquity();
-});
+async function updateLiveAccountChart() {
+  const live = await api.get("/api/equity_live");
+  state.liveAcct = { balance: live.total_balance, equity: live.total_equity, floating: live.total_floating };
+  paintTopline();
+  renderLiveAccountChart(live.per_worker);
+}
 
-
-// ═══ PORTFOLIO ═══
+// ═══════════════════════════════════════════════
+// PORTFOLIO
+// ═══════════════════════════════════════════════
 let portEquityChart = null, portEquitySeries = null;
 let portDdChart = null, portDdSeries = null;
 let portHistChart = null, portHistSeries = null;
 
 async function loadPortfolio() {
-  const [p, equity] = await Promise.all([api.get("/api/portfolio"), api.get("/api/equity")]);
+  const [p, equity, live] = await Promise.all([
+    api.get("/api/portfolio"), api.get("/api/equity"), api.get("/api/equity_live"),
+  ]);
+  state.liveAcct = { balance: live.total_balance, equity: live.total_equity, floating: live.total_floating };
+  paintTopline();
   renderMetrics(p);
   renderPortfolioEquity(equity);
   renderDrawdown(equity);
   renderByWorker(p.by_worker || []);
   renderHistogram(equity);
   loadTrades();
+}
+async function refreshPortfolioLive() {
+  const live = await api.get("/api/equity_live");
+  state.liveAcct = { balance: live.total_balance, equity: live.total_equity, floating: live.total_floating };
+  paintTopline();
 }
 
 function renderMetrics(p) {
@@ -380,7 +455,7 @@ function renderMetrics(p) {
     cell("Best Trade",     fmt.money(p.best_trade),                    "single max",        "pos"),
     cell("Worst Trade",    fmt.money(p.worst_trade),                   "single min",        "neg"),
     cell("Max Drawdown",   fmt.money(-p.max_drawdown),                 `${p.max_dd_pct.toFixed(1)}% from peak`, ddKind),
-    cell("Sharpe (per-tr)",p.sharpe.toFixed(2),                        "per-trade ratio"),
+    cell("Sharpe (tr)",    p.sharpe.toFixed(2),                        "per-trade ratio"),
     cell("Avg R",          p.avg_r.toFixed(2) + "R",                   "risk-multiple"),
     cell("Avg Hold",       p.avg_bars_held.toFixed(1),                 "bars per trade"),
     cell("Longest Win",    p.longest_win_streak + "",                  "consecutive wins",  "pos"),
@@ -391,16 +466,18 @@ function renderMetrics(p) {
 }
 
 function renderPortfolioEquity(equity) {
-  const el = $("#port-equity"); if (!el) return;
+  const el = $("#port-equity-chart"); if (!el) return;
   if (!portEquityChart) {
-    portEquityChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portEquityChart = LightweightCharts.createChart(el, {
+      ...chartBaseOpts(el), handleScroll: false, handleScale: false,
+    });
     portEquitySeries = portEquityChart.addAreaSeries({
       lineColor: cssVar("--success"),
-      topColor:  "color-mix(in srgb, " + cssVar("--success") + " 30%, transparent)",
-      bottomColor:"color-mix(in srgb, " + cssVar("--success") + " 2%, transparent)",
+      topColor: "color-mix(in srgb, " + cssVar("--success") + " 30%, transparent)",
+      bottomColor: "color-mix(in srgb, " + cssVar("--success") + " 0%, transparent)",
       lineWidth: 2,
     });
-    new ResizeObserver(() => portEquityChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+    new ResizeObserver(() => { portEquityChart.resize(el.clientWidth, el.clientHeight); portEquityChart.timeScale().fitContent(); }).observe(el);
   }
   const data = equity.map((e, i) => ({ time: i + 1, value: e.cum }));
   portEquitySeries.setData(data);
@@ -410,19 +487,18 @@ function renderPortfolioEquity(equity) {
 function renderDrawdown(equity) {
   const el = $("#port-dd"); if (!el) return;
   if (!portDdChart) {
-    portDdChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portDdChart = LightweightCharts.createChart(el, {
+      ...chartBaseOpts(el), handleScroll: false, handleScale: false,
+    });
     portDdSeries = portDdChart.addAreaSeries({
       lineColor: cssVar("--danger"),
-      topColor:  "color-mix(in srgb, " + cssVar("--danger") + " 2%, transparent)",
-      bottomColor:"color-mix(in srgb, " + cssVar("--danger") + " 30%, transparent)",
+      topColor: "color-mix(in srgb, " + cssVar("--danger") + " 2%, transparent)",
+      bottomColor: "color-mix(in srgb, " + cssVar("--danger") + " 30%, transparent)",
       lineWidth: 2,
     });
-    new ResizeObserver(() => portDdChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+    new ResizeObserver(() => { portDdChart.resize(el.clientWidth, el.clientHeight); portDdChart.timeScale().fitContent(); }).observe(el);
   }
-  let peak = 0; const data = equity.map((e, i) => {
-    if (e.cum > peak) peak = e.cum;
-    return { time: i + 1, value: -(peak - e.cum) };
-  });
+  let peak = 0; const data = equity.map((e, i) => { if (e.cum > peak) peak = e.cum; return { time: i + 1, value: -(peak - e.cum) }; });
   portDdSeries.setData(data);
   if (data.length) portDdChart.timeScale().fitContent();
 }
@@ -446,13 +522,14 @@ function renderByWorker(byW) {
 function renderHistogram(equity) {
   const el = $("#port-hist"); if (!el) return;
   if (!portHistChart) {
-    portHistChart = LightweightCharts.createChart(el, chartBaseOpts(el));
+    portHistChart = LightweightCharts.createChart(el, {
+      ...chartBaseOpts(el), handleScroll: false, handleScale: false,
+    });
     portHistSeries = portHistChart.addHistogramSeries({ priceFormat: { type: "volume" } });
-    new ResizeObserver(() => portHistChart.resize(el.clientWidth, el.clientHeight)).observe(el);
+    new ResizeObserver(() => { portHistChart.resize(el.clientWidth, el.clientHeight); portHistChart.timeScale().fitContent(); }).observe(el);
   }
   const pnls = equity.map(e => e.pnl || 0).filter(p => p !== 0);
   if (!pnls.length) { portHistSeries.setData([]); return; }
-  // bucket into 14 buckets
   const min = Math.min(...pnls), max = Math.max(...pnls);
   const buckets = 14;
   const step = (max - min) / buckets || 1;
@@ -463,48 +540,49 @@ function renderHistogram(equity) {
   });
   const data = counts.map((c, i) => {
     const center = min + step * (i + 0.5);
-    return {
-      time: i + 1,
-      value: c,
-      color: center >= 0 ? cssVar("--success") : cssVar("--danger"),
-    };
+    return { time: i + 1, value: c, color: center >= 0 ? cssVar("--success") : cssVar("--danger") };
   });
   portHistSeries.setData(data);
   portHistChart.timeScale().fitContent();
 }
 
-// ═══ FLEET ═══
+// ═══════════════════════════════════════════════
+// FLEET
+// ═══════════════════════════════════════════════
 async function loadFleet() {
   const workers = await api.get("/api/workers");
   state.workers = workers;
   const grid = $("#fleet-grid"); if (!grid) return;
-  grid.innerHTML = workers.map(w => `
-    <div class="worker-card">
-      <div class="worker-card-head">
-        <div class="worker-card-id">
-          <span class="pulse-state ${w.state}" style="width:12px;height:12px;"></span>
-          ${w.id}
+  grid.innerHTML = workers.map(w => {
+    const fl = (w.last_equity != null && w.last_balance != null) ? (w.last_equity - w.last_balance) : null;
+    return `
+      <div class="worker-card">
+        <div class="worker-card-head">
+          <div class="worker-card-id">
+            <span class="pulse-state ${w.state}" style="width:12px;height:12px;"></span>
+            ${w.id}
+          </div>
+          <span class="worker-state-badge ${w.state}">${w.state}</span>
         </div>
-        <span class="worker-state-badge ${w.state}">${w.state}</span>
-      </div>
-      <div class="worker-card-stats">
-        <div class="stat-cell"><label>broker</label><b>${w.broker || "—"}</b></div>
-        <div class="stat-cell"><label>account</label><b>${w.account || "—"}</b></div>
-        <div class="stat-cell"><label>balance</label><b>${w.last_balance != null ? "$"+Number(w.last_balance).toFixed(2) : "—"}</b></div>
-        <div class="stat-cell"><label>equity</label><b>${w.last_equity  != null ? "$"+Number(w.last_equity).toFixed(2)  : "—"}</b></div>
-        <div class="stat-cell"><label>positions</label><b>${w.open_positions ?? 0}</b></div>
-        <div class="stat-cell"><label>bars in mem</label><b>${w.mem_bars ?? 0}</b></div>
-        <div class="stat-cell"><label>last hb</label><b>${w.last_heartbeat ? fmt.short(w.last_heartbeat) : "—"}</b></div>
-        <div class="stat-cell"><label>version</label><b>${w.version || "—"}</b></div>
-      </div>
-      <div class="worker-card-actions">
-        <button onclick="cmd('${w.id}','start')">start</button>
-        <button onclick="cmd('${w.id}','stop')">stop</button>
-        <button onclick="cmd('${w.id}','restart')">restart</button>
-        <button onclick="cmd('${w.id}','reload_config')">↻ cfg</button>
-        <button onclick="cmd('${w.id}','ping')">ping</button>
-      </div>
-    </div>`).join("") || `<div style="padding:32px;color:var(--text-3)">no workers — add a config in main/configs/&lt;worker_id&gt;.json</div>`;
+        <div class="worker-card-stats">
+          <div class="stat-cell"><label>broker</label><b>${w.broker || "—"}</b></div>
+          <div class="stat-cell"><label>account</label><b>${w.account || "—"}</b></div>
+          <div class="stat-cell"><label>balance</label><b>${w.last_balance != null ? "$"+Number(w.last_balance).toFixed(2) : "—"}</b></div>
+          <div class="stat-cell"><label>equity</label><b>${w.last_equity  != null ? "$"+Number(w.last_equity).toFixed(2)  : "—"}</b></div>
+          <div class="stat-cell"><label>floating</label>${fl != null ? `<b class="${fl>=0?'pos':'neg'}">${fl>=0?"+":""}$${fl.toFixed(2)}</b>` : "<b>—</b>"}</div>
+          <div class="stat-cell"><label>positions</label><b>${w.open_positions ?? 0}</b></div>
+          <div class="stat-cell"><label>bars in mem</label><b>${w.mem_bars ?? 0}</b></div>
+          <div class="stat-cell"><label>last hb</label><b>${w.last_heartbeat ? fmt.short(w.last_heartbeat) : "—"}</b></div>
+        </div>
+        <div class="worker-card-actions">
+          <button onclick="cmd('${w.id}','start')"><i class="fa-solid fa-play"></i></button>
+          <button onclick="cmd('${w.id}','stop')"><i class="fa-solid fa-stop"></i></button>
+          <button onclick="cmd('${w.id}','restart')"><i class="fa-solid fa-rotate-right"></i></button>
+          <button onclick="cmd('${w.id}','reload_config')"><i class="fa-solid fa-arrows-rotate"></i></button>
+          <button onclick="cmd('${w.id}','ping')"><i class="fa-solid fa-satellite-dish"></i></button>
+        </div>
+      </div>`;
+  }).join("") || `<div style="padding:32px;color:var(--text-3)">no workers — add a config in main/configs/&lt;worker_id&gt;.json</div>`;
 }
 async function cmd(id, action) {
   const r = await api.post(`/api/workers/${id}/${action}`);
@@ -512,7 +590,9 @@ async function cmd(id, action) {
   loadFleet();
 }
 
-// ═══ TRADES (now embedded in portfolio) ═══
+// ═══════════════════════════════════════════════
+// TRADES
+// ═══════════════════════════════════════════════
 async function loadTrades() {
   const wEl = $("#trade-filter-worker"); const sEl = $("#trade-filter-status");
   const wid = wEl ? wEl.value.trim() : ""; const st = sEl ? sEl.value : "";
@@ -540,8 +620,9 @@ async function loadTrades() {
 }
 function verdictHtml(v) {
   if (!v) return "—";
-  if (v.match) return `<span class="verdict-ok">✓ match</span>`;
-  return `<span class="verdict-bad" title="${escapeHtml(v.reason||"")}">⚠ ${(v.reason||"").slice(0,30)}</span>`;
+  if (v.inconclusive) return `<span style="color:var(--text-3)">➖ inconclusive</span>`;
+  if (v.match) return `<span class="verdict-ok"><i class="fa-solid fa-check"></i> match</span>`;
+  return `<span class="verdict-bad" title="${escapeHtml(v.reason||"")}"><i class="fa-solid fa-triangle-exclamation"></i> ${(v.reason||"").slice(0,30)}</span>`;
 }
 document.addEventListener("input", e => {
   if (e.target.id === "trade-filter-worker") { clearTimeout(window._tf); window._tf = setTimeout(loadTrades, 300); }
@@ -552,7 +633,9 @@ document.addEventListener("change", e => {
   if (e.target.id === "log-filter-level")    loadLogs();
 });
 
-// ═══ CHARTS PAGE ═══
+// ═══════════════════════════════════════════════
+// CHARTS
+// ═══════════════════════════════════════════════
 async function initChartsPage() {
   const workers = await api.get("/api/workers");
   state.workers = workers;
@@ -562,13 +645,11 @@ async function initChartsPage() {
   if (!state.chartWorker && workers.length) state.chartWorker = workers[0].id;
   if (state.chartWorker) { sel.value = state.chartWorker; rebindChart(); }
 }
-
 async function rebindChart() {
   const wid = $("#chart-worker").value;
   state.chartWorker = wid;
   state.chartBars = []; state.chartMarkers = [];
   $("#chart-fills").innerHTML = "";
-
   const el = $("#live-chart");
   if (!state.chart) {
     state.chart = LightweightCharts.createChart(el, chartBaseOpts(el));
@@ -579,7 +660,6 @@ async function rebindChart() {
     });
     new ResizeObserver(() => state.chart.resize(el.clientWidth, el.clientHeight)).observe(el);
   }
-
   const { bars, markers } = await api.get(`/api/bars/${wid}`);
   state.chartBars = bars.map(toCandle);
   state.candleSeries.setData(state.chartBars);
@@ -587,11 +667,9 @@ async function rebindChart() {
   state.chartMarkers = lwMarkers;
   state.candleSeries.setMarkers(lwMarkers);
   state.chart.timeScale().fitContent();
-
   const w = state.workers.find(x => x.id === wid);
   if (w) updateSideFromHB(w);
 }
-
 function toCandle(b) { return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; }
 function toMarker(m) {
   if (!m.ts) return null;
@@ -603,12 +681,11 @@ function toMarker(m) {
     text:     m.type === "open" ? `#${m.ticket}` : `${(m.net_pnl||0)>=0?"+":""}${Number(m.net_pnl||0).toFixed(0)}`,
   };
 }
-
 function addChartBar(bar) { if (state.candleSeries) state.candleSeries.update(toCandle(bar)); }
 function addChartMarker(trade, type) {
   if (!state.candleSeries) return;
   const m = toMarker({
-    ts:    type === "open" ? trade.entry_time : trade.exit_time,
+    ts: type === "open" ? trade.entry_time : trade.exit_time,
     type, dir: trade.dir,
     price: type === "open" ? trade.actual_entry : trade.actual_exit,
     net_pnl: trade.net_pnl, ticket: trade.ticket,
@@ -644,7 +721,9 @@ function pushFill(trade, kind) {
     </div>`);
 }
 
-// ═══ LOGS ═══
+// ═══════════════════════════════════════════════
+// LOGS
+// ═══════════════════════════════════════════════
 async function loadLogs() {
   const w = $("#log-filter-worker").value.trim();
   const l = $("#log-filter-level").value;
@@ -660,7 +739,7 @@ function logLineHtml(r) {
   return `<div class="log-line">
     <span class="log-ts">${fmt.short(r.ts)}</span>
     <span class="log-level ${r.level}">${r.level}</span>
-    <span class="log-worker">${r.worker_id || "—"}</span>
+    <span class="log-worker">${escapeHtml(r.worker_id || "—")}</span>
     <span class="log-msg">${escapeHtml(r.message || "")}</span>
   </div>`;
 }
@@ -679,41 +758,123 @@ function appendLogLive(msg) {
   if ($("#log-autoscroll").checked) el.scrollTop = el.scrollHeight;
 }
 
-// ═══ CONFIG ═══
+// ═══════════════════════════════════════════════
+// SETTINGS (configs + DB)
+// ═══════════════════════════════════════════════
+function initSettings() {
+  // tabs
+  $$("#settings-tabs .seg-btn").forEach(b => b.onclick = () => {
+    $$("#settings-tabs .seg-btn").forEach(x => x.classList.toggle("active", x === b));
+    $$(".settings-pane").forEach(p => p.classList.toggle("active", p.dataset.pane === b.dataset.tab));
+    if (b.dataset.tab === "db") loadDbTables();
+    if (b.dataset.tab === "configs") loadConfigList();
+  });
+  loadConfigList();
+}
+
+let currentConfigId = null;
 async function loadConfigList() {
   const ids = await api.get("/api/configs");
-  const sel = $("#config-select");
-  sel.innerHTML = ids.map(i => `<option value="${i}">${i}</option>`).join("");
-  if (ids.length) loadConfig();
+  $("#config-list-items").innerHTML = ids.map(i => `
+    <div class="config-list-item ${i === currentConfigId ? "active" : ""}" data-id="${i}">
+      <b>${i}</b>
+      <small><i class="fa-solid fa-file-code"></i></small>
+    </div>`).join("") || `<div style="padding:16px;color:var(--text-3);font-size:11px">no configs</div>`;
+  $$("#config-list-items .config-list-item").forEach(el => {
+    el.onclick = () => { currentConfigId = el.dataset.id; loadConfig(); loadConfigList(); };
+  });
+  if (!currentConfigId && ids.length) { currentConfigId = ids[0]; loadConfig(); loadConfigList(); }
 }
 async function loadConfig() {
-  const id = $("#config-select").value; if (!id) return;
-  const cfg = await api.get(`/api/configs/${id}`);
+  if (!currentConfigId) return;
+  const cfg = await api.get(`/api/configs/${currentConfigId}`);
+  $("#config-editor-title").textContent = currentConfigId;
   $("#config-editor").value = JSON.stringify(cfg, null, 2);
 }
 async function saveConfig() {
-  const id = $("#config-select").value;
+  if (!currentConfigId) return;
   let cfg;
   try { cfg = JSON.parse($("#config-editor").value); }
   catch (e) { toast("error", "invalid JSON: " + e.message); return; }
-  const r = await api.put(`/api/configs/${id}`, cfg);
-  toast(r.ok ? "success" : "error", r.ok ? `${id} saved & pushed` : "save failed");
+  const r = await api.put(`/api/configs/${currentConfigId}`, cfg);
+  toast(r.ok ? "success" : "error", r.ok ? `${currentConfigId} saved & pushed` : "save failed");
 }
 
-// ═══ COMMAND PALETTE ═══
+// ═══ DB EDITOR ═══
+async function loadDbTables() {
+  const tables = await api.get("/api/db/tables");
+  $("#db-table-list").innerHTML = tables.map(t => `
+    <div class="db-table-item ${t.name === state.dbTable ? "active" : ""}" data-name="${t.name}">
+      <b>${t.name}</b>
+      <small>${t.row_count} rows</small>
+    </div>`).join("");
+  $$("#db-table-list .db-table-item").forEach(el => {
+    el.onclick = () => { state.dbTable = el.dataset.name; state.dbOffset = 0; loadDbTable(); loadDbTables(); };
+  });
+  if (!state.dbTable && tables.length) { state.dbTable = tables[0].name; loadDbTable(); loadDbTables(); }
+}
+async function loadDbTable() {
+  if (!state.dbTable) return;
+  const d = await api.get(`/api/db/table/${state.dbTable}?limit=${state.dbLimit}&offset=${state.dbOffset}`);
+  $("#db-table-title").textContent = d.name;
+  $("#db-pagination").textContent = `${state.dbOffset+1}–${Math.min(state.dbOffset+state.dbLimit,d.total)} / ${d.total}`;
+  const thead = $("#db-rows thead"), tbody = $("#db-rows tbody");
+  thead.innerHTML = `<tr>${d.columns.map(c => `<th>${c}</th>`).join("")}<th></th></tr>`;
+  tbody.innerHTML = d.rows.map(r => `
+    <tr>
+      ${d.columns.map(c => `<td title="${escapeHtml(formatCell(r[c]))}">${escapeHtml(formatCell(r[c]).slice(0,80))}</td>`).join("")}
+      <td><button class="btn-ghost" onclick="dbDeleteRow('${r[d.pk[0]]}')" style="padding:2px 8px;height:24px"><i class="fa-solid fa-trash"></i></button></td>
+    </tr>`).join("") || `<tr><td colspan="${d.columns.length+1}" style="text-align:center;color:var(--text-3);padding:24px">empty</td></tr>`;
+}
+function formatCell(v) {
+  if (v == null) return "—";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+async function dbDeleteRow(id) {
+  if (!confirm(`Delete row ${id} from ${state.dbTable}?`)) return;
+  const r = await api.del(`/api/db/table/${state.dbTable}/${id}`);
+  toast(r.ok ? "success" : "error", r.ok ? "deleted" : "delete failed");
+  loadDbTable(); loadDbTables();
+}
+$("#db-prev").onclick = () => { state.dbOffset = Math.max(0, state.dbOffset - state.dbLimit); loadDbTable(); };
+$("#db-next").onclick = () => { state.dbOffset += state.dbLimit; loadDbTable(); };
+
+async function runDbQuery() {
+  const q = $("#db-query").value.trim();
+  if (!q) return;
+  const r = await api.post("/api/db/query", { query: q });
+  const out = $("#db-query-result");
+  if (!r.ok) {
+    out.innerHTML = `<div style="padding:12px;color:var(--danger);font-family:var(--font-mono);font-size:11px">${escapeHtml(r.error)}</div>`;
+    return;
+  }
+  if (!r.rows.length) { out.innerHTML = `<div style="padding:12px;color:var(--text-3);font-size:11px">0 rows</div>`; return; }
+  const cols = Object.keys(r.rows[0]);
+  out.innerHTML = `
+    <table class="data-table">
+      <thead><tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>
+      <tbody>${r.rows.map(row => `<tr>${cols.map(c => `<td>${escapeHtml(formatCell(row[c]).slice(0,80))}</td>`).join("")}</tr>`).join("")}</tbody>
+    </table>
+    <div style="padding:8px 12px;color:var(--text-3);font-size:11px">${r.count} rows</div>`;
+}
+
+// ═══════════════════════════════════════════════
+// COMMAND PALETTE
+// ═══════════════════════════════════════════════
 const palette = $("#cmd-palette");
 const cmdInput = $("#cmd-input");
 const cmdResults = $("#cmd-results");
 let cmdSel = 0;
 
 const cmdActions = [
-  {ico: "◉", label: "Go to Mission Control", sub: "home",      fn: () => navigate("home")},
-  {ico: "$", label: "Go to Portfolio",       sub: "portfolio", fn: () => navigate("portfolio")},
-  {ico: "▦", label: "Go to Fleet",           sub: "fleet",     fn: () => navigate("fleet")},
-  {ico: "▲", label: "Go to Live Charts",     sub: "charts",    fn: () => navigate("charts")},
-  {ico: "≡", label: "Go to Logs",            sub: "logs",      fn: () => navigate("logs")},
-  {ico: "◈", label: "Go to Configs",         sub: "config",    fn: () => navigate("config")},
-  {ico: "◐", label: "Toggle theme panel",    sub: "theme",     fn: () => $("#theme-panel").classList.toggle("hidden")},
+  {ico: "fa-gauge-high", label: "Mission Control", sub: "go",  fn: () => navigate("home")},
+  {ico: "fa-chart-pie",  label: "Portfolio",       sub: "go",  fn: () => navigate("portfolio")},
+  {ico: "fa-server",     label: "Fleet",           sub: "go",  fn: () => navigate("fleet")},
+  {ico: "fa-chart-line", label: "Live Charts",     sub: "go",  fn: () => navigate("charts")},
+  {ico: "fa-terminal",   label: "Logs",            sub: "go",  fn: () => navigate("logs")},
+  {ico: "fa-sliders",    label: "Settings",        sub: "go",  fn: () => navigate("config")},
+  {ico: "fa-palette",    label: "Toggle theme panel", sub: "appearance", fn: () => $("#theme-panel").classList.toggle("hidden")},
 ];
 
 function openPalette()  { palette.classList.remove("hidden"); cmdInput.value = ""; cmdInput.focus(); renderCmd(""); }
@@ -737,13 +898,13 @@ palette.addEventListener("click", e => { if (e.target === palette) closePalette(
 function currentResults() {
   const q = cmdInput.value.trim().toLowerCase();
   const workerActions = state.workers.flatMap(w => ([
-    {ico: "▶", label: `Start ${w.id}`,   sub: "worker action", fn: () => cmd(w.id, "start")},
-    {ico: "■", label: `Stop ${w.id}`,    sub: "worker action", fn: () => cmd(w.id, "stop")},
-    {ico: "⟳", label: `Restart ${w.id}`, sub: "worker action", fn: () => cmd(w.id, "restart")},
-    {ico: "↻", label: `Reload config ${w.id}`, sub: "worker action", fn: () => cmd(w.id, "reload_config")},
+    {ico: "fa-play",          label: `Start ${w.id}`,    sub: "worker", fn: () => cmd(w.id, "start")},
+    {ico: "fa-stop",          label: `Stop ${w.id}`,     sub: "worker", fn: () => cmd(w.id, "stop")},
+    {ico: "fa-rotate-right",  label: `Restart ${w.id}`,  sub: "worker", fn: () => cmd(w.id, "restart")},
+    {ico: "fa-arrows-rotate", label: `Reload config ${w.id}`, sub: "worker", fn: () => cmd(w.id, "reload_config")},
   ]));
   const themeActions = ["midnight","abyss","terminal","paper","daylight"].map(t => (
-    {ico: "◐", label: `Theme: ${t}`, sub: "appearance", fn: () => { applyTheme(t); markActiveTheme(); }}
+    {ico: "fa-palette", label: `Theme: ${t}`, sub: "theme", fn: () => { applyTheme(t); markActiveTheme(); }}
   ));
   const all = [...cmdActions, ...themeActions, ...workerActions];
   if (!q) return all.slice(0, 10);
@@ -754,7 +915,7 @@ function renderCmd(_q, reset = true) {
   const results = currentResults();
   cmdResults.innerHTML = results.map((r, i) => `
     <div class="cmd-result ${i === cmdSel ? "sel" : ""}" data-i="${i}">
-      <span class="ico">${r.ico}</span>
+      <span class="ico"><i class="fa-solid ${r.ico}"></i></span>
       <span class="lbl">${r.label}</span>
       <span class="sub">${r.sub}</span>
     </div>`).join("");
@@ -766,4 +927,6 @@ function renderCmd(_q, reset = true) {
 // ═══ BOOT ═══
 connectWS();
 loadHome();
-setInterval(() => { if (state.activePage === "home") loadHome(); }, 8000);
+refreshLiveTopline();
+setInterval(refreshLiveTopline, 5000);
+setInterval(() => { if (state.activePage === "home") loadHome(); }, 12000);

@@ -52,6 +52,7 @@ class FleetManager:
         self.ui_clients = set()
         self.bar_history = {}      # worker_id -> deque of bars
         self.recent_trade_markers = {}  # worker_id -> deque of {ts, type, price, dir}
+        self.equity_history = {}   # worker_id -> deque of {ts, balance, equity, floating}
 
     async def attach(self, worker_id, ws, hello_payload):
         if worker_id in self.workers:
@@ -103,7 +104,17 @@ class FleetManager:
 
         if mtype == "heartbeat":
             store.update_heartbeat(worker_id, payload)
-            self._add_trade_marker(worker_id, payload, marker_type="open")
+            # capture live balance/equity snapshot for live charts
+            bal = payload.get("balance"); eq = payload.get("equity")
+            if bal is not None and eq is not None:
+                from collections import deque
+                buf = self.equity_history.setdefault(worker_id, deque(maxlen=1440))  # ~2hr @ 5s
+                buf.append({
+                    "ts":       datetime.now(timezone.utc).isoformat(),
+                    "balance":  float(bal),
+                    "equity":   float(eq),
+                    "floating": float(eq) - float(bal),
+                })
             await self._broadcast_ui({"type": "heartbeat", "worker_id": worker_id, "payload": payload})
 
         elif mtype == "trade.opened":

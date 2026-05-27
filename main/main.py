@@ -152,6 +152,83 @@ def api_equity():
                     "pnl": t.get("net_pnl"), "worker": t.get("worker_id")})
     return out
 
+@app.get("/api/equity_live")
+def api_equity_live():
+    """Live aggregated balance/equity across the fleet, from heartbeats."""
+    per_worker = {}
+    total_bal = 0.0; total_eq = 0.0
+    for wid, buf in fleet.equity_history.items():
+        per_worker[wid] = list(buf)
+        if buf:
+            total_bal += buf[-1]["balance"]
+            total_eq  += buf[-1]["equity"]
+    # build aggregate timeline by aligning all worker series
+    return {
+        "per_worker":      per_worker,
+        "total_balance":   round(total_bal, 2),
+        "total_equity":    round(total_eq, 2),
+        "total_floating":  round(total_eq - total_bal, 2),
+    }
+
+
+# ─── DB editor (read + careful writes) ─────────────────────────
+from sqlalchemy import inspect, text
+
+@app.get("/api/db/tables")
+def api_db_tables():
+    insp = inspect(store.engine)
+    out = []
+    with store.db_session() as s:
+        for name in insp.get_table_names():
+            cols = [{"name": c["name"], "type": str(c["type"])} for c in insp.get_columns(name)]
+            try:
+                count = s.execute(text(f'SELECT COUNT(*) FROM "{name}"')).scalar()
+            except Exception:
+                count = 0
+            out.append({"name": name, "columns": cols, "row_count": count})
+    return out
+
+
+@app.get("/api/db/table/{name}")
+def api_db_get_table(name: str, limit: int = 50, offset: int = 0):
+    insp = inspect(store.engine)
+    if name not in insp.get_table_names():
+        raise HTTPException(404, "table not found")
+    cols = [c["name"] for c in insp.get_columns(name)]
+    pk_cols = [c["name"] for c in insp.get_pk_constraint(name).get("constrained_columns", [])] or ["id"]
+    with store.db_session() as s:
+        # use ORDER BY pk DESC for sanity if pk exists
+        order = f'ORDER BY "{pk_cols[0]}" DESC' if pk_cols and pk_cols[0] in cols else ""
+        rows = s.execute(text(f'SELECT * FROM "{name}" {order} LIMIT :l OFFSET :o'),
+                         {"l": limit, "o": offset}).mappings().all()
+        total = s.execute(text(f'SELECT COUNT(*) FROM "{name}"')).scalar()
+    return {"name": name, "columns": cols, "pk": pk_cols, "rows": [dict(r) for r in rows],
+            "total": total, "limit": limit, "offset": offset}
+
+
+@app.delete("/api/db/table/{name}/{row_id}")
+def api_db_delete(name: str, row_id: str):
+    insp = inspect(store.engine)
+    if name not in insp.get_table_names():
+        raise HTTPException(404, "table not found")
+    pk = (insp.get_pk_constraint(name).get("constrained_columns") or ["id"])[0]
+    with store.db_session() as s:
+        s.execute(text(f'DELETE FROM "{name}" WHERE "{pk}" = :v'), {"v": row_id})
+    return {"ok": True}
+
+
+@app.post("/api/db/query")
+def api_db_query(payload: dict):
+    q = (payload.get("query") or "").strip()
+    if not q.lower().startswith("select"):
+        return {"ok": False, "error": "only SELECT queries allowed"}
+    with store.db_session() as s:
+        try:
+            rows = s.execute(text(q)).mappings().all()
+            return {"ok": True, "rows": [dict(r) for r in rows], "count": len(rows)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
 @app.post("/api/workers/{worker_id}/stop")
 async def api_stop(worker_id: str):
     ok, msg = await fleet.send_command(worker_id, "cmd.stop"); return {"ok": ok, "msg": msg}

@@ -166,8 +166,9 @@ class StrategyEngine:
         self.open_trades = []
         self.live_bars_seen = 0
 
-        # auto-detected from symbol info, NOT from cfg (cfg value is fallback only)
-        self.point_value_per_lot = None
+        # static — taken from config, no auto-detect (which gave wrong values
+        # because broker contract specs aren't $1/pt/lot on USTEC)
+        self.point_value_per_lot = float(config.get("point_value_per_lot", 1.0))
 
     # ─── helpers ────────────────────────────────────────────────
     def _log(self, level, msg):
@@ -175,29 +176,6 @@ class StrategyEngine:
 
     def _err(self, msg, ctx=None):
         self.on_event("error", {"message": msg, "context": ctx or {}})
-
-    def _resolve_point_value(self):
-        """
-        Resolve $/pt/lot from MT5 symbol_info. This is the #1 source of
-        PnL discrepancy if hardcoded wrong. tick_value / tick_size gives
-        the dollar value per 1.0 point per 1.0 lot.
-        """
-        info = mt5.symbol_info(self.cfg["symbol"])
-        if info is None:
-            self._err("symbol_info None during point_value resolve, falling back to config")
-            return float(self.cfg.get("point_value_per_lot", 1.0))
-
-        tick_value = getattr(info, "trade_tick_value", None)
-        tick_size  = getattr(info, "trade_tick_size", None)
-        if tick_value and tick_size and tick_size > 0:
-            pv = tick_value / tick_size
-            self._log("INFO",
-                f"point_value auto-detected: tick_value={tick_value} tick_size={tick_size} "
-                f"=> ${pv:.4f}/pt/lot (cfg said ${self.cfg.get('point_value_per_lot', 1.0)})")
-            return pv
-
-        self._err("could not read tick_value/tick_size, falling back to config")
-        return float(self.cfg.get("point_value_per_lot", 1.0))
 
     def _get_current_risk(self):
         c = self.cfg
@@ -219,9 +197,6 @@ class StrategyEngine:
 
         self.live_bars_seen += 1
 
-        # lazy-init point value on first live bar (after warmup)
-        if self.point_value_per_lot is None:
-            self.point_value_per_lot = self._resolve_point_value()
 
         self.on_event("bar", {
             "bar": bar,
@@ -272,7 +247,7 @@ class StrategyEngine:
     # ─── ORDER EXECUTION ────────────────────────────────────────
     def _open_trade(self, reversal_dir, bars_snapshot, streak_slice, signal_bar):
         c = self.cfg
-        pv = self.point_value_per_lot or float(c.get("point_value_per_lot", 1.0))
+        pv = self.point_value_per_lot
 
         theo_entry = self.streamer.level
         if reversal_dir == 1:
@@ -447,60 +422,19 @@ class StrategyEngine:
         close_deal = max(deals, key=lambda d: d.time)
         self._finalize_trade(trade, exit_bar, close_deal.price, hit_sl=True, close_attempts=0)
 
-    def _fetch_broker_pnl(self, ticket):
-        """
-        Authoritative PnL from MT5: sum of profit + commission + swap
-        across ALL deals for this position (entry deal + close deal).
-        Returns dict with broker_gross, broker_commission, broker_swap, broker_net.
-        """
-        from_time = datetime.now(timezone.utc) - timedelta(hours=24)
-        deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
-        if not deals:
-            return None
-
-        gross      = sum(d.profit for d in deals)
-        commission = sum(d.commission for d in deals)
-        swap       = sum(d.swap for d in deals)
-        net        = gross + commission + swap
-        return {
-            "broker_gross":      gross,
-            "broker_commission": commission,
-            "broker_swap":       swap,
-            "broker_net":        net,
-            "deal_count":        len(deals),
-        }
 
     def _finalize_trade(self, trade, exit_bar, actual_exit, hit_sl, close_attempts=0):
         c = self.cfg
-        pv = self.point_value_per_lot or trade.get("point_value_per_lot", 1.0)
+        pv = self.point_value_per_lot  # static from config
 
         actual_entry = trade["actual_entry"]
         is_long = trade["dir"] == 1
 
-        # ── THEORETICAL pnl (matches backtester formula for validator) ──
-        theo_pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
-        theo_gross_pnl  = theo_pnl_points * trade["lots"] * pv
-        theo_commission = trade["lots"] * c["commission_per_lot"]
-        theo_net_pnl    = theo_gross_pnl - theo_commission
-
-        # ── REAL pnl (broker-reported, source of truth) ──
-        broker = self._fetch_broker_pnl(trade["ticket"])
-        if broker is not None:
-            real_net_pnl    = broker["broker_net"]
-            real_gross_pnl  = broker["broker_gross"]
-            real_commission = abs(broker["broker_commission"])  # MT5 reports commission as negative
-            real_swap       = broker["broker_swap"]
-            self._log("INFO",
-                f"broker PnL ticket={trade['ticket']}: "
-                f"gross=${real_gross_pnl:+.2f} comm=${broker['broker_commission']:+.2f} "
-                f"swap=${real_swap:+.2f} net=${real_net_pnl:+.2f} "
-                f"(theo_net=${theo_net_pnl:+.2f} diff=${real_net_pnl-theo_net_pnl:+.2f})")
-        else:
-            self._err(f"broker PnL unavailable for ticket {trade['ticket']}, falling back to theoretical")
-            real_net_pnl    = theo_net_pnl
-            real_gross_pnl  = theo_gross_pnl
-            real_commission = theo_commission
-            real_swap       = 0.0
+        # theoretical PnL (matches backtester) — single source of truth
+        pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
+        gross_pnl  = pnl_points * trade["lots"] * pv
+        commission = trade["lots"] * c["commission_per_lot"]
+        net_pnl    = gross_pnl - commission
 
         expected_total = (c["streak_size"] + 1) + trade["bars_since_entry"]
         actual_total   = len(trade["bars_window"])
@@ -514,27 +448,13 @@ class StrategyEngine:
             "actual_exit": actual_exit,
             "hit_sl":      hit_sl,
             "close_attempts": close_attempts,
-
-            # backwards-compat fields (default to REAL pnl so dashboard shows truth)
-            "pnl_points":  theo_pnl_points,
-            "gross_pnl":   real_gross_pnl,
-            "commission":  real_commission,
-            "net_pnl":     real_net_pnl,
-            "swap":        real_swap,
-
-            # detailed split for debugging / validator
-            "theo_pnl_points":  theo_pnl_points,
-            "theo_gross_pnl":   theo_gross_pnl,
-            "theo_commission":  theo_commission,
-            "theo_net_pnl":     theo_net_pnl,
-
-            "broker_gross":      real_gross_pnl,
-            "broker_commission": broker["broker_commission"] if broker else None,
-            "broker_swap":       real_swap,
-            "broker_net":        real_net_pnl,
-
+            "pnl_points":  pnl_points,
+            "gross_pnl":   gross_pnl,
+            "commission":  commission,
+            "net_pnl":     net_pnl,
+            "swap":        0.0,
             "bars_held":   trade["bars_since_entry"],
-            "r_multiple":  real_net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
+            "r_multiple":  net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
         })
 
         # remove BEFORE emitting close so heartbeats are accurate
@@ -542,8 +462,8 @@ class StrategyEngine:
             self.open_trades.remove(trade)
 
         self.on_event("trade.closed", trade)
-        self._log("INFO", f"CLOSE ticket={trade['ticket']} REAL pnl=${real_net_pnl:+.2f} "
-                          f"(theo=${theo_net_pnl:+.2f}) "
+        self._log("INFO", f"CLOSE ticket={trade['ticket']} pnl=${net_pnl:+.2f} "
+                          f"({pnl_points:+.2f}pt × {trade['lots']} × ${pv}/pt - ${commission:.2f}) "
                           f"reason={'SL' if hit_sl else 'TP'} attempts={close_attempts} | "
                           f"remaining_open={len(self.open_trades)}")
 
@@ -659,10 +579,6 @@ def run(config, on_event, stop_event):
     info = mt5.symbol_info(c["symbol"])
     if info is None:
         _err(f"symbol_info({c['symbol']}) returned None"); mt5.shutdown(); return
-    _log("INFO", f"symbol {c['symbol']}: bid={info.bid} ask={info.ask} "
-                 f"volume_min={info.volume_min} step={info.volume_step} "
-                 f"tick_value={getattr(info,'trade_tick_value',None)} "
-                 f"tick_size={getattr(info,'trade_tick_size',None)}")
 
     is_warmup = [True]
     streamer = LiveKokoCandleStreamer(

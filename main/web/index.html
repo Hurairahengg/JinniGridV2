@@ -2,13 +2,15 @@
 <html lang="en" data-theme="midnight" data-density="normal">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <meta name="theme-color" content="#060912" />
   <title>Jinni Grid · Mission Control</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/font-awesome/6.5.1/css/all.min.css">
   <link rel="stylesheet" href="/web/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 
@@ -20,8 +22,12 @@
 
 <!-- TOPBAR -->
 <header class="topbar">
+  <button id="nav-toggle" class="icon-btn nav-toggle" title="Menu">
+    <i class="fa-solid fa-bars"></i>
+  </button>
+
   <div class="brand">
-    <div class="brand-mark">◆</div>
+    <div class="brand-mark"><i class="fa-solid fa-bolt"></i></div>
     <div class="brand-text">
       <div class="brand-title">JINNI GRID</div>
       <div class="brand-sub">mission control</div>
@@ -29,16 +35,18 @@
   </div>
 
   <button id="cmd-trigger" class="cmd-trigger">
-    <span class="cmd-icon">⌕</span>
-    <span class="cmd-text">Search workers, trades, commands…</span>
+    <i class="fa-solid fa-magnifying-glass cmd-icon"></i>
+    <span class="cmd-text">Search · jump · command…</span>
     <span class="cmd-kbd"><kbd>⌘</kbd><kbd>K</kbd></span>
   </button>
 
   <div class="topbar-right">
-    <button id="theme-btn" class="icon-btn" title="Theme"><span id="theme-icon">◐</span></button>
-    <div id="alert-pill" class="alert-pill hidden">
-      <span class="alert-dot"></span><span id="alert-count">0</span>
+    <div class="live-equity-pill" id="hdr-equity-pill" title="Account equity (live)">
+      <span class="lep-label">EQT</span>
+      <span class="lep-value" id="hdr-equity">—</span>
+      <span class="lep-float" id="hdr-floating">—</span>
     </div>
+    <button id="theme-btn" class="icon-btn" title="Theme"><i class="fa-solid fa-palette"></i></button>
     <div class="status-pill" id="conn-pill">
       <span class="status-dot"></span><span id="conn-text">connecting</span>
     </div>
@@ -50,26 +58,11 @@
 <div id="theme-panel" class="theme-panel hidden">
   <div class="theme-panel-head">Theme</div>
   <div class="theme-grid">
-    <button class="theme-swatch" data-theme="midnight">
-      <div class="swatch-preview midnight-prev"></div>
-      <span>Midnight</span>
-    </button>
-    <button class="theme-swatch" data-theme="abyss">
-      <div class="swatch-preview abyss-prev"></div>
-      <span>Abyss</span>
-    </button>
-    <button class="theme-swatch" data-theme="terminal">
-      <div class="swatch-preview terminal-prev"></div>
-      <span>Terminal</span>
-    </button>
-    <button class="theme-swatch" data-theme="paper">
-      <div class="swatch-preview paper-prev"></div>
-      <span>Paper</span>
-    </button>
-    <button class="theme-swatch" data-theme="daylight">
-      <div class="swatch-preview daylight-prev"></div>
-      <span>Daylight</span>
-    </button>
+    <button class="theme-swatch" data-theme="midnight"><div class="swatch-preview midnight-prev"></div><span>Midnight</span></button>
+    <button class="theme-swatch" data-theme="abyss"><div class="swatch-preview abyss-prev"></div><span>Abyss</span></button>
+    <button class="theme-swatch" data-theme="terminal"><div class="swatch-preview terminal-prev"></div><span>Terminal</span></button>
+    <button class="theme-swatch" data-theme="paper"><div class="swatch-preview paper-prev"></div><span>Paper</span></button>
+    <button class="theme-swatch" data-theme="daylight"><div class="swatch-preview daylight-prev"></div><span>Daylight</span></button>
   </div>
   <div class="theme-panel-head">Accent</div>
   <div class="accent-row">
@@ -86,46 +79,49 @@
   </div>
 </div>
 
+<!-- MOBILE BACKDROP -->
+<div id="mobile-backdrop" class="mobile-backdrop hidden"></div>
+
 <!-- SIDEBAR -->
-<nav class="sidebar">
+<nav class="sidebar" id="sidebar">
   <button class="nav-item active" data-page="home"      title="Mission Control">
-    <span class="nav-icon">◉</span><span class="nav-label">Mission</span>
+    <i class="fa-solid fa-gauge-high nav-icon"></i><span class="nav-label">Mission</span>
   </button>
   <button class="nav-item" data-page="portfolio" title="Portfolio">
-    <span class="nav-icon">$</span><span class="nav-label">Portfolio</span>
+    <i class="fa-solid fa-chart-pie nav-icon"></i><span class="nav-label">Portfolio</span>
   </button>
-  <button class="nav-item" data-page="fleet"     title="Fleet">
-    <span class="nav-icon">▦</span><span class="nav-label">Fleet</span>
+  <button class="nav-item" data-page="fleet" title="Fleet">
+    <i class="fa-solid fa-server nav-icon"></i><span class="nav-label">Fleet</span>
   </button>
-  <button class="nav-item" data-page="charts"    title="Live Charts">
-    <span class="nav-icon">▲</span><span class="nav-label">Charts</span>
+  <button class="nav-item" data-page="charts" title="Live Charts">
+    <i class="fa-solid fa-chart-line nav-icon"></i><span class="nav-label">Charts</span>
   </button>
-  <button class="nav-item" data-page="logs"      title="Logs">
-    <span class="nav-icon">≡</span><span class="nav-label">Logs</span>
+  <button class="nav-item" data-page="logs" title="Logs">
+    <i class="fa-solid fa-terminal nav-icon"></i><span class="nav-label">Logs</span>
   </button>
-  <button class="nav-item" data-page="config"    title="Configs">
-    <span class="nav-icon">◈</span><span class="nav-label">Configs</span>
+  <button class="nav-item" data-page="config" title="Settings">
+    <i class="fa-solid fa-sliders nav-icon"></i><span class="nav-label">Settings</span>
   </button>
   <div class="sidebar-spacer"></div>
-  <div class="sidebar-version">v0.1.0</div>
+  <div class="sidebar-version">v0.2.0</div>
 </nav>
 
 <!-- CONTENT -->
 <main class="content">
 
-<!-- HOME -->
+  <!-- ─────────────────── HOME ─────────────────── -->
   <section class="page active" data-page="home">
     <header class="page-header tight">
-      <div class="ph-left">
-        <h1 class="page-title">Mission Control</h1>
+      <div>
+        <h1 class="page-title"><i class="fa-solid fa-satellite-dish title-icon"></i> Mission Control</h1>
         <p class="page-sub">live infrastructure overview</p>
       </div>
       <div class="ph-right">
-        <div class="quick-stat">
+        <div class="quick-stat" title="Today's realized PnL">
           <span class="qs-label">today</span>
           <span class="qs-value" id="hdr-today">—</span>
         </div>
-        <div class="quick-stat">
+        <div class="quick-stat" title="Closed trades in last 24h">
           <span class="qs-label">trades 24h</span>
           <span class="qs-value" id="hdr-24h">0</span>
         </div>
@@ -133,64 +129,53 @@
       </div>
     </header>
 
-    <!-- KPI STRIP -->
+    <!-- KPI STRIP (5 cells now) -->
     <div class="kpi-strip">
-      <div class="kpi-cell" id="kpi-pnl">
-        <div class="kc-label">net pnl</div>
-        <div class="kc-row">
-          <div class="kc-value">$0.00</div>
-          <div class="kc-spark" id="kpi-pnl-spark"></div>
-        </div>
-        <div class="kc-foot">all-time · <span id="kpi-trades">0 trades</span></div>
-      </div>
-      <div class="kpi-cell" id="kpi-wr">
-        <div class="kc-label">win rate</div>
-        <div class="kc-row">
-          <div class="kc-value">0%</div>
-          <div class="kc-bar"><div class="kc-bar-fill" id="kpi-wr-bar"></div></div>
-        </div>
-        <div class="kc-foot"><span id="kpi-wl">0W / 0L</span></div>
-      </div>
-      <div class="kpi-cell" id="kpi-fleet">
-        <div class="kc-label">fleet</div>
-        <div class="kc-row">
-          <div class="kc-value">0 / 0</div>
-          <div class="kc-dots" id="kpi-fleet-dots"></div>
-        </div>
-        <div class="kc-foot">running / total</div>
-      </div>
-      <div class="kpi-cell" id="kpi-positions">
-        <div class="kc-label">open positions</div>
-        <div class="kc-row">
-          <div class="kc-value">0</div>
-          <div class="kc-mini" id="kpi-pos-mini">—</div>
-        </div>
+      <div class="kpi-cell" id="kpi-balance">
+        <div class="kc-head"><i class="fa-solid fa-wallet"></i> <span>balance</span></div>
+        <div class="kc-value">$0</div>
         <div class="kc-foot">across fleet</div>
       </div>
+      <div class="kpi-cell" id="kpi-equity">
+        <div class="kc-head"><i class="fa-solid fa-scale-balanced"></i> <span>equity <em class="live-dot"></em></span></div>
+        <div class="kc-value">$0</div>
+        <div class="kc-foot">balance + floating</div>
+      </div>
+      <div class="kpi-cell" id="kpi-floating">
+        <div class="kc-head"><i class="fa-solid fa-water"></i> <span>floating <em class="live-dot"></em></span></div>
+        <div class="kc-value">$0.00</div>
+        <div class="kc-foot">unrealized PnL</div>
+      </div>
+      <div class="kpi-cell" id="kpi-pnl">
+        <div class="kc-head"><i class="fa-solid fa-coins"></i> <span>net pnl</span></div>
+        <div class="kc-value">$0.00</div>
+        <div class="kc-foot"><span id="kpi-trades">0 trades</span></div>
+      </div>
+      <div class="kpi-cell" id="kpi-fleet">
+        <div class="kc-head"><i class="fa-solid fa-server"></i> <span>fleet</span></div>
+        <div class="kc-value">0 / 0</div>
+        <div class="kc-dots" id="kpi-fleet-dots"></div>
+      </div>
     </div>
 
-    <!-- EQUITY (full width) -->
+    <!-- ACCOUNT CHART (live balance + equity over time) -->
     <div class="panel panel-equity-full">
       <div class="panel-header">
-        <h3>Equity Curve</h3>
+        <h3><i class="fa-solid fa-chart-area"></i> Account · Live</h3>
         <div class="eq-controls">
+          <span class="legend"><span class="dot dot-balance"></span> balance</span>
+          <span class="legend"><span class="dot dot-equity"></span> equity</span>
           <span class="panel-sub" id="equity-meta">—</span>
-          <div class="seg">
-            <button class="seg-btn active" data-range="all">all</button>
-            <button class="seg-btn" data-range="100">100</button>
-            <button class="seg-btn" data-range="50">50</button>
-            <button class="seg-btn" data-range="20">20</button>
-          </div>
         </div>
       </div>
-      <div id="equity-chart" class="equity-chart-full"></div>
+      <div id="live-account-chart" class="equity-chart-full"></div>
     </div>
 
-    <!-- 3-COL BOTTOM GRID -->
+    <!-- BOTTOM 3-COL -->
     <div class="home-bottom">
       <div class="panel">
         <div class="panel-header">
-          <h3>Fleet</h3>
+          <h3><i class="fa-solid fa-server"></i> Fleet</h3>
           <span class="panel-sub" id="fleet-pulse-sub">—</span>
         </div>
         <div id="fleet-pulse" class="fleet-pulse"></div>
@@ -198,77 +183,87 @@
 
       <div class="panel">
         <div class="panel-header">
-          <h3>Activity</h3>
+          <h3><i class="fa-solid fa-position"></i><i class="fa-solid fa-arrows-up-down"></i> Open Positions</h3>
+          <span class="panel-sub" id="positions-sub">0 open</span>
+        </div>
+        <div id="positions-list" class="positions-list"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h3><i class="fa-solid fa-rss"></i> Activity</h3>
           <span class="panel-sub">realtime feed</span>
         </div>
         <div id="activity-feed" class="activity-feed"></div>
       </div>
-
-      <div class="panel">
-        <div class="panel-header">
-          <h3>Movers</h3>
-          <span class="panel-sub">last 24h</span>
-        </div>
-        <div id="movers" class="movers"></div>
-      </div>
     </div>
   </section>
 
-  <!-- PORTFOLIO -->
+  <!-- ─────────────────── PORTFOLIO ─────────────────── -->
   <section class="page" data-page="portfolio">
     <header class="page-header">
       <div>
-        <h1 class="page-title">Portfolio</h1>
-        <p class="page-sub">full analytics across closed trades</p>
+        <h1 class="page-title"><i class="fa-solid fa-chart-pie title-icon"></i> Portfolio</h1>
+        <p class="page-sub">closed-trade analytics + live account state</p>
       </div>
       <div class="page-actions filters">
-        <button class="btn-ghost" onclick="loadPortfolio()">↻ refresh</button>
+        <button class="btn-ghost" onclick="loadPortfolio()"><i class="fa-solid fa-rotate"></i> refresh</button>
       </div>
     </header>
 
-    <!-- top metric grid -->
+    <!-- LIVE KPI STRIP -->
+    <div class="kpi-strip strip-3">
+      <div class="kpi-cell" id="port-balance">
+        <div class="kc-head"><i class="fa-solid fa-wallet"></i> <span>balance</span></div>
+        <div class="kc-value">$0</div>
+        <div class="kc-foot">live</div>
+      </div>
+      <div class="kpi-cell" id="port-equity">
+        <div class="kc-head"><i class="fa-solid fa-scale-balanced"></i> <span>equity <em class="live-dot"></em></span></div>
+        <div class="kc-value">$0</div>
+        <div class="kc-foot">live</div>
+      </div>
+      <div class="kpi-cell" id="port-floating">
+        <div class="kc-head"><i class="fa-solid fa-water"></i> <span>floating</span></div>
+        <div class="kc-value">$0.00</div>
+        <div class="kc-foot">unrealized PnL</div>
+      </div>
+    </div>
+
+    <!-- METRIC GRID -->
     <div class="metric-grid" id="metric-grid"></div>
 
-    <!-- big equity + drawdown -->
+    <!-- equity + drawdown -->
     <div class="port-grid">
       <div class="panel">
         <div class="panel-header">
-          <h3>Equity Curve</h3>
-          <span class="panel-sub">cumulative pnl · log-of-trades scale</span>
+          <h3><i class="fa-solid fa-chart-line"></i> Realized Equity (closed trades)</h3>
         </div>
-        <div id="port-equity" class="port-chart"></div>
+        <div id="port-equity-chart" class="port-chart"></div>
       </div>
       <div class="panel">
         <div class="panel-header">
-          <h3>Drawdown</h3>
-          <span class="panel-sub">peak-to-trough</span>
+          <h3><i class="fa-solid fa-arrow-trend-down"></i> Drawdown</h3>
         </div>
         <div id="port-dd" class="port-chart"></div>
       </div>
     </div>
 
-    <!-- per-worker + distribution -->
     <div class="port-grid">
       <div class="panel">
-        <div class="panel-header">
-          <h3>PnL by Worker</h3>
-          <span class="panel-sub">contribution breakdown</span>
-        </div>
+        <div class="panel-header"><h3><i class="fa-solid fa-users"></i> PnL by Worker</h3></div>
         <div id="port-by-worker" class="by-worker"></div>
       </div>
       <div class="panel">
-        <div class="panel-header">
-          <h3>PnL Distribution</h3>
-          <span class="panel-sub">trade outcome buckets</span>
-        </div>
+        <div class="panel-header"><h3><i class="fa-solid fa-chart-column"></i> PnL Distribution</h3></div>
         <div id="port-hist" class="port-chart"></div>
       </div>
     </div>
 
-    <!-- trade history table -->
+    <!-- TRADE HISTORY -->
     <div class="panel" style="margin-top:16px">
       <div class="panel-header">
-        <h3>Trade History</h3>
+        <h3><i class="fa-solid fa-clock-rotate-left"></i> Trade History</h3>
         <div class="filters">
           <input id="trade-filter-worker" placeholder="worker id…" />
           <select id="trade-filter-status">
@@ -291,43 +286,41 @@
     </div>
   </section>
 
-  <!-- FLEET -->
+  <!-- ─────────────────── FLEET ─────────────────── -->
   <section class="page" data-page="fleet">
     <header class="page-header">
       <div>
-        <h1 class="page-title">Fleet</h1>
+        <h1 class="page-title"><i class="fa-solid fa-server title-icon"></i> Fleet</h1>
         <p class="page-sub">distributed VM workers</p>
       </div>
     </header>
     <div id="fleet-grid" class="fleet-grid"></div>
   </section>
 
-  <!-- CHARTS -->
+  <!-- ─────────────────── CHARTS ─────────────────── -->
   <section class="page" data-page="charts">
     <header class="page-header">
       <div>
-        <h1 class="page-title">Live Chart</h1>
+        <h1 class="page-title"><i class="fa-solid fa-chart-line title-icon"></i> Live Chart</h1>
         <p class="page-sub">range bars + trades · streaming</p>
       </div>
       <div class="page-actions filters">
         <select id="chart-worker"></select>
-        <button class="btn-ghost" onclick="rebindChart()">↻</button>
+        <button class="btn-ghost" onclick="rebindChart()"><i class="fa-solid fa-rotate"></i></button>
       </div>
     </header>
     <div class="chart-layout">
-      <div class="panel panel-chart">
-        <div id="live-chart" class="live-chart"></div>
-      </div>
+      <div class="panel panel-chart"><div id="live-chart" class="live-chart"></div></div>
       <aside class="chart-side">
         <div class="panel">
           <div class="panel-header"><h3>State</h3></div>
           <div class="kv">
-            <div><span>Engine</span><b id="chart-engine">—</b></div>
-            <div><span>Live bars</span><b id="chart-livebars">0</b></div>
-            <div><span>Last bar</span><b id="chart-lastts">—</b></div>
-            <div><span>Open ticket</span><b id="chart-ticket">—</b></div>
-            <div><span>Balance</span><b id="chart-balance">—</b></div>
-            <div><span>Equity</span><b id="chart-equity">—</b></div>
+            <div><span><i class="fa-solid fa-microchip"></i> Engine</span><b id="chart-engine">—</b></div>
+            <div><span><i class="fa-solid fa-bars-staggered"></i> Live bars</span><b id="chart-livebars">0</b></div>
+            <div><span><i class="fa-solid fa-clock"></i> Last bar</span><b id="chart-lastts">—</b></div>
+            <div><span><i class="fa-solid fa-ticket"></i> Open ticket</span><b id="chart-ticket">—</b></div>
+            <div><span><i class="fa-solid fa-wallet"></i> Balance</span><b id="chart-balance">—</b></div>
+            <div><span><i class="fa-solid fa-scale-balanced"></i> Equity</span><b id="chart-equity">—</b></div>
           </div>
         </div>
         <div class="panel">
@@ -338,11 +331,11 @@
     </div>
   </section>
 
-  <!-- LOGS -->
+  <!-- ─────────────────── LOGS ─────────────────── -->
   <section class="page" data-page="logs">
     <header class="page-header">
       <div>
-        <h1 class="page-title">Logs</h1>
+        <h1 class="page-title"><i class="fa-solid fa-terminal title-icon"></i> Logs</h1>
         <p class="page-sub">streaming from every VM</p>
       </div>
       <div class="page-actions filters">
@@ -352,7 +345,7 @@
           <option>INFO</option><option>WARN</option><option>ERROR</option>
         </select>
         <label class="toggle"><input type="checkbox" id="log-autoscroll" checked /> autoscroll</label>
-        <button class="btn-ghost" onclick="loadLogs()">↻</button>
+        <button class="btn-ghost" onclick="loadLogs()"><i class="fa-solid fa-rotate"></i></button>
       </div>
     </header>
     <div class="panel panel-logs">
@@ -360,21 +353,68 @@
     </div>
   </section>
 
-  <!-- CONFIG -->
+  <!-- ─────────────────── SETTINGS / DB ─────────────────── -->
   <section class="page" data-page="config">
     <header class="page-header">
       <div>
-        <h1 class="page-title">Configs</h1>
-        <p class="page-sub">per-worker strategy parameters</p>
-      </div>
-      <div class="page-actions filters">
-        <select id="config-select"></select>
-        <button class="btn-ghost" onclick="loadConfig()">load</button>
-        <button class="btn-primary" onclick="saveConfig()">save & push</button>
+        <h1 class="page-title"><i class="fa-solid fa-sliders title-icon"></i> Settings</h1>
+        <p class="page-sub">worker configs · database editor</p>
       </div>
     </header>
-    <div class="panel">
-      <textarea id="config-editor" class="config-editor" spellcheck="false"></textarea>
+
+    <div class="seg seg-large" id="settings-tabs">
+      <button class="seg-btn active" data-tab="configs"><i class="fa-solid fa-file-code"></i> Strategy Configs</button>
+      <button class="seg-btn" data-tab="db"><i class="fa-solid fa-database"></i> Database</button>
+    </div>
+
+    <!-- CONFIGS sub-tab -->
+    <div class="settings-pane active" data-pane="configs">
+      <div class="config-layout">
+        <aside class="panel config-list">
+          <div class="panel-header"><h3>Workers</h3></div>
+          <div id="config-list-items"></div>
+        </aside>
+        <div class="panel config-editor-wrap">
+          <div class="panel-header">
+            <h3 id="config-editor-title">Select a worker</h3>
+            <div class="filters">
+              <button class="btn-ghost" onclick="loadConfig()"><i class="fa-solid fa-rotate"></i> reload</button>
+              <button class="btn-primary" onclick="saveConfig()"><i class="fa-solid fa-floppy-disk"></i> save & push</button>
+            </div>
+          </div>
+          <textarea id="config-editor" class="config-editor" spellcheck="false"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- DB sub-tab -->
+    <div class="settings-pane" data-pane="db">
+      <div class="db-layout">
+        <aside class="panel db-tables">
+          <div class="panel-header"><h3>Tables</h3></div>
+          <div id="db-table-list"></div>
+        </aside>
+        <div class="panel db-viewer">
+          <div class="panel-header">
+            <h3 id="db-table-title">Select a table</h3>
+            <div class="filters">
+              <span id="db-pagination" class="panel-sub">—</span>
+              <button class="btn-ghost" id="db-prev"><i class="fa-solid fa-chevron-left"></i></button>
+              <button class="btn-ghost" id="db-next"><i class="fa-solid fa-chevron-right"></i></button>
+              <button class="btn-ghost" onclick="loadDbTable()"><i class="fa-solid fa-rotate"></i></button>
+            </div>
+          </div>
+          <div class="table-wrap db-rows-wrap"><table class="data-table" id="db-rows"><thead></thead><tbody></tbody></table></div>
+
+          <div class="panel-header" style="border-top:1px solid var(--border-1);border-bottom:none;margin-top:8px">
+            <h3><i class="fa-solid fa-magnifying-glass-chart"></i> SQL Query (SELECT only)</h3>
+            <button class="btn-primary" onclick="runDbQuery()"><i class="fa-solid fa-play"></i> run</button>
+          </div>
+          <textarea id="db-query" class="config-editor" style="min-height:100px" spellcheck="false"
+                    placeholder="SELECT * FROM trades WHERE net_pnl > 0 LIMIT 20"></textarea>
+          <div id="db-query-result" class="table-wrap"></div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -390,7 +430,6 @@
 </div>
 
 <div id="toast-stack" class="toast-stack"></div>
-
 <script src="/web/app.js"></script>
 </body>
 </html>
