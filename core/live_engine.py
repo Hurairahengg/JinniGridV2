@@ -1,28 +1,22 @@
 """
-Koko Live Engine — USTEC 8pt streaming + 2-streak/3-tp strategy
-=================================================================
-- MT5 tick stream  →  Koko candles (8pt grid, 2x rev, clean ON)
-- Warmup: pulls historical ticks until 100 bars generated, THEN goes live
-- Strategy (1:1 backtest):
-    * 2 same-color bricks (streak)
-    * 1 opposite brick (reversal candle)
-    * enter immediately at market in reversal direction
-    * SL = entry ∓ 16pt (intrabar tick-level kill)
-    * exit on close of bar (entry + 3)   ← TP_CLOSE_AFTER bars after entry bar
-- LIVE_TRADING = False by default → sim mode, no MT5 orders fired
-- Flask serves chart.html on :5000 with all bars + entry/exit markers
-
-Run:  python live_engine.py
+Koko Live Engine — USTEC streaming + 2-streak/3-tp strategy
+============================================================
+- MT5 tick stream → Koko bars (8pt grid, 2x rev, clean ON)
+- Warmup: pulls recent ticks, builds bars up to NOW, then goes live
+- Strategy: 1:1 with backtester, OVERLAPPING positions allowed
+- Risk: scaling, $1 per $100 balance, 1pt × 1lot = $1
+- Flask serves chart.html + JSON state on :5000
 """
-import validator
-import json
+
 import time
 import threading
 from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
-import telegram_bot as tg
 from flask import Flask, jsonify, send_from_directory
+
+import telegram_bot as tg
+import validator
 
 # ============================ CONFIG ============================
 
@@ -30,47 +24,42 @@ SYMBOL                = "USTEC"
 RANGE_SIZE            = 8.0
 REV_BRICKS            = 2.0
 CLEAN_MODE            = True
-PRICE_DECIMALS        = 2          # ← your broker shows 2 decimals
+PRICE_DECIMALS        = 2
 WARMUP_BARS           = 100
-WARMUP_LOOKBACK_DAYS  = 7
+WARMUP_LOOKBACK_DAYS  = 7      # auto-extends if not enough bars
 
-# Strategy (matches backtest)
+# Strategy
 STREAK_SIZE           = 2
 TP_CLOSE_AFTER        = 3
 FIXED_SL_POINTS       = 16.0
 SLIPPAGE_POINTS       = 0.3
-COMMISSION_PER_LOT    = 0.8        # fixed $ per lot, one-side, scales with lots
-POINT_VALUE_PER_LOT   = 1.0        # 1 point × 1 lot = $1 PnL
+COMMISSION_PER_LOT    = 0.8    # one-side, scales with lots
+POINT_VALUE_PER_LOT   = 1.0    # 1pt × 1lot = $1
 
-# Risk / sizing (SCALING MODE: risk 1$ per 100$ balance)
-STARTING_BALANCE      = 3100.0     # ← edit to your real start capital
-RISK_PER_100          = 1.0        # 1.0 = risk $1 per $100 balance (1% per trade)
+# Risk (scaling: 1$ per 100$ of balance)
+STARTING_BALANCE      = 1000.0
+RISK_PER_100          = 1.0
 MIN_LOTS              = 0.01
 MAX_LOTS              = 600.0
 
 # Execution
-LIVE_TRADING          = True       # ← ARMED. fires real MT5 orders.
+LIVE_TRADING          = True
 MAGIC_NUMBER          = 770808
 DEVIATION_POINTS      = 20
 TICK_POLL_MS          = 50
 
 # Web
 HTTP_PORT             = 5000
+CHART_MAX_BARS        = 500    # payload trim
 
 # =================== KOKO STREAMER (1:1 range_bars.py) ===================
 
 class KokoCandleStreamer:
-    """
-    Identical brick math to range_bars.py KokoCandleStreamer.
-    Difference: emits via callback (no file IO), and exposes get_working_bar()
-    so the live chart can render the forming brick in real time.
-    """
-
     def __init__(self, range_size, price_decimals, rev_bricks, clean_mode, on_bar_close):
-        self.rs         = float(range_size)
-        self.pd         = price_decimals
-        self.rev_bricks = rev_bricks
-        self.clean_mode = clean_mode
+        self.rs           = float(range_size)
+        self.pd           = price_decimals
+        self.rev_bricks   = rev_bricks
+        self.clean_mode   = clean_mode
         self.on_bar_close = on_bar_close
 
         self.trend = 0
@@ -127,8 +116,8 @@ class KokoCandleStreamer:
         }
 
     def process_tick(self, tick):
-        p = tick["price"]
-        v = tick["volume"]
+        p  = tick["price"]
+        v  = tick["volume"]
         rs = self.rs
 
         if self.bar is None:
@@ -147,7 +136,6 @@ class KokoCandleStreamer:
         while True:
             lvl = self.level
 
-            # ── STARTUP ──────────────────────────────────────
             if self.trend == 0:
                 up_t   = round(lvl + rs, self.pd)
                 down_t = round(lvl - rs, self.pd)
@@ -160,7 +148,6 @@ class KokoCandleStreamer:
                 else:
                     break
 
-            # ── BULL ─────────────────────────────────────────
             elif self.trend == 1:
                 cont_t = round(lvl + rs, self.pd)
                 rev_t  = round(lvl - self.rev_bricks * rs, self.pd)
@@ -183,7 +170,6 @@ class KokoCandleStreamer:
                 else:
                     break
 
-            # ── BEAR ─────────────────────────────────────────
             elif self.trend == -1:
                 cont_t = round(lvl - rs, self.pd)
                 rev_t  = round(lvl + self.rev_bricks * rs, self.pd)
@@ -207,7 +193,7 @@ class KokoCandleStreamer:
                     break
 
 
-# ============================ STRATEGY ============================
+# ============================ HELPERS ============================
 
 def candle_dir(c):
     if c["close"] > c["open"]: return 1
@@ -215,31 +201,45 @@ def candle_dir(c):
     return 0
 
 
-class StrategyEngine:
-    """
-    1:1 backtest logic with OVERLAPPING positions.
-    - last STREAK_SIZE bars same color, last bar opposite → signal fires every time
-    - each position lives independently: own entry, own SL, own bars_held counter
-    - SL checked per-tick on every open position
-    - TP: exit on close of the bar where bars_held == TP_CLOSE_AFTER + 1
-    """
+def tick_to_price(t):
+    """Convert MT5 named-tuple or struct to our {ts, price, volume} format."""
+    bid = float(t.bid) if hasattr(t, "bid") else float(t["bid"])
+    ask = float(t.ask) if hasattr(t, "ask") else float(t["ask"])
+    ts  = int(t.time)  if hasattr(t, "time") else int(t["time"])
+    try:
+        vol = float(t.volume) if hasattr(t, "volume") else float(t["volume"])
+    except Exception:
+        vol = 0.0
 
+    if bid > 0 and ask > 0:
+        price = (bid + ask) / 2.0
+    elif bid > 0:
+        price = bid
+    elif ask > 0:
+        price = ask
+    else:
+        return None
+    return {"ts": ts, "price": price, "volume": vol, "bid": bid, "ask": ask}
+
+
+# ============================ STRATEGY ============================
+
+class StrategyEngine:
     def __init__(self):
         self.positions     = []
         self.trades        = []
-        self.validations   = []   # list of validator results, one per closed trade
+        self.validations   = []
         self.markers       = []
         self.warmup_done   = False
         self.equity        = 0.0
         self._trade_id_seq = 0
-        self._validate_fn  = None   # injected by LiveEngine so we can pass bars
+        self._validate_fn  = None
 
     def _next_trade_id(self):
         self._trade_id_seq += 1
         return self._trade_id_seq
 
     def _current_risk_dollars(self):
-        """Risk $ per trade: 1$ per 100$ of balance."""
         balance = STARTING_BALANCE + self.equity
         if balance <= 0:
             return 0.0
@@ -249,7 +249,6 @@ class StrategyEngine:
         risk = self._current_risk_dollars()
         if risk <= 0:
             return 0.0
-        # 1 pt = $1 per 1 lot → lots = risk$ / SL_points so SL hit ≈ -risk$
         raw = risk / FIXED_SL_POINTS
         return max(MIN_LOTS, min(MAX_LOTS, round(raw, 2)))
 
@@ -269,8 +268,6 @@ class StrategyEngine:
             return 0
         return rev_dir
 
-    # ── OPEN ─────────────────────────────────────────────────────
-
     def _open_position(self, direction, signal_bar):
         theoretical_entry = signal_bar["close"]
         if direction == 1:
@@ -282,21 +279,21 @@ class StrategyEngine:
 
         lots = self._calc_lots()
         if lots <= 0:
-            print(f"[NO ENTRY] balance non-positive, skipping signal")
+            print("[NO ENTRY] balance non-positive, skipping signal")
             return
-        tid  = self._next_trade_id()
 
+        tid = self._next_trade_id()
         pos = {
             "id":            tid,
             "dir":           direction,
-            "risk_used":     self._current_risk_dollars(),
             "entry_price":   round(entry_price, PRICE_DECIMALS),
             "sl_price":      round(sl_price,    PRICE_DECIMALS),
             "lots":          lots,
             "entry_time":    signal_bar["time"],
-            "bars_held":     1,    # signal bar = entry bar = bar 1
+            "bars_held":     1,
             "mfe_points":    0.0,
             "mae_points":    0.0,
+            "risk_used":     self._current_risk_dollars(),
             "broker_ticket": None,
         }
         self.positions.append(pos)
@@ -306,25 +303,19 @@ class StrategyEngine:
             "position": "belowBar" if direction == 1 else "aboveBar",
             "color":    "#4caf50" if direction == 1 else "#ef5350",
             "shape":    "arrowUp" if direction == 1 else "arrowDown",
-            "text":     f"#{tid} {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.1f}",
+            "text":     f"#{tid} {'L' if direction == 1 else 'S'} {entry_price:.2f}",
         })
 
         if LIVE_TRADING:
             self._send_mt5_order(pos)
 
-        print(f"[ENTRY #{tid}] {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.1f}  SL={sl_price:.1f}  lots={lots}  (open={len(self.positions)})")
+        print(f"[ENTRY #{tid}] {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.2f}  "
+              f"SL={sl_price:.2f}  lots={lots}  risk=${pos['risk_used']:.2f}  (open={len(self.positions)})")
 
         tg.notify_entry(
-            trade_id=tid,
-            direction=direction,
-            entry=entry_price,
-            sl=sl_price,
-            lots=lots,
-            bar_time=signal_bar["time"],
-            position_count=len(self.positions),
+            trade_id=tid, direction=direction, entry=entry_price, sl=sl_price,
+            lots=lots, bar_time=signal_bar["time"], position_count=len(self.positions),
         )
-
-    # ── CLOSE ────────────────────────────────────────────────────
 
     def _close_position(self, pos, exit_price, reason, exit_time):
         if pos["dir"] == 1:
@@ -332,7 +323,7 @@ class StrategyEngine:
         else:
             pnl_points = pos["entry_price"] - exit_price
 
-        gross      = pnl_points * pos["lots"]
+        gross      = pnl_points * pos["lots"] * POINT_VALUE_PER_LOT
         commission = pos["lots"] * COMMISSION_PER_LOT
         net        = gross - commission
 
@@ -345,14 +336,15 @@ class StrategyEngine:
             "exit":       round(exit_price, PRICE_DECIMALS),
             "sl":         pos["sl_price"],
             "lots":       pos["lots"],
-            "pnl_points": round(pnl_points, 2),
+            "pnl_points": round(pnl_points, 4),
             "net_pnl":    round(net, 2),
             "reason":     reason,
             "entry_time": pos["entry_time"],
             "exit_time":  exit_time,
             "bars_held":  pos["bars_held"],
-            "mfe_points": round(pos["mfe_points"], 2),
-            "mae_points": round(pos["mae_points"], 2),
+            "mfe_points": round(pos["mfe_points"], 4),
+            "mae_points": round(pos["mae_points"], 4),
+            "risk_used":  pos["risk_used"],
         }
         self.trades.append(trade)
 
@@ -370,20 +362,17 @@ class StrategyEngine:
         if pos in self.positions:
             self.positions.remove(pos)
 
-        print(f"[EXIT/{reason} #{pos['id']}] @ {exit_price:.1f}  pnl={net:+.2f}$  bars_held={pos['bars_held']}  equity=${self.equity:.2f}  (open={len(self.positions)})")
+        print(f"[EXIT/{reason} #{pos['id']}] @ {exit_price:.2f}  "
+              f"pnl={net:+.2f}$  bars_held={pos['bars_held']}  equity=${self.equity:.2f}  "
+              f"(open={len(self.positions)})")
 
         tg.notify_exit(
-            trade_id=pos["id"],
-            direction=pos["dir"],
-            entry=pos["entry_price"],
-            exit_px=exit_price,
-            net_pnl=net,
-            reason=reason,
-            bars_held=pos["bars_held"],
-            equity=self.equity,
+            trade_id=pos["id"], direction=pos["dir"], entry=pos["entry_price"],
+            exit_px=exit_price, net_pnl=net, reason=reason,
+            bars_held=pos["bars_held"], equity=self.equity,
             position_count=len(self.positions),
         )
-        # ── run the validator on this closed trade ────────────
+
         if self._validate_fn is not None:
             try:
                 v_result = self._validate_fn(trade)
@@ -393,15 +382,11 @@ class StrategyEngine:
             except Exception as e:
                 print(f"[VALIDATOR-ERR] {e}")
 
-    # ── TICK HOOK (per-position SL check) ────────────────────────
-
     def on_tick(self, tick):
         if not self.positions:
             return
         price = tick["price"]
-        # iterate over copy so we can close mid-loop
         for pos in list(self.positions):
-            # MFE/MAE
             if pos["dir"] == 1:
                 fav = price - pos["entry_price"]
                 adv = pos["entry_price"] - price
@@ -411,18 +396,13 @@ class StrategyEngine:
             if fav > pos["mfe_points"]: pos["mfe_points"] = fav
             if adv > pos["mae_points"]: pos["mae_points"] = adv
 
-            # SL
             if pos["dir"] == 1 and price <= pos["sl_price"]:
-                exit_price = pos["sl_price"] - SLIPPAGE_POINTS
-                self._close_position(pos, exit_price, "SL", tick["ts"])
+                self._close_position(pos, pos["sl_price"] - SLIPPAGE_POINTS, "SL", tick["ts"])
             elif pos["dir"] == -1 and price >= pos["sl_price"]:
-                exit_price = pos["sl_price"] + SLIPPAGE_POINTS
-                self._close_position(pos, exit_price, "SL", tick["ts"])
-
-    # ── BAR CLOSE HOOK ───────────────────────────────────────────
+                self._close_position(pos, pos["sl_price"] + SLIPPAGE_POINTS, "SL", tick["ts"])
 
     def on_bar_close(self, bar, all_bars):
-        # 1) age existing positions and exit any that reach TP horizon
+        # 1) age existing positions, TP-exit any that hit horizon
         for pos in list(self.positions):
             pos["bars_held"] += 1
             if pos["bars_held"] >= TP_CLOSE_AFTER + 1:
@@ -432,26 +412,22 @@ class StrategyEngine:
                     exit_price = bar["close"] + SLIPPAGE_POINTS
                 self._close_position(pos, exit_price, "TP", bar["time"])
 
-        # 2) signal scan — ALWAYS, regardless of open positions (overlap)
+        # 2) scan for new signal (only when live)
         if not self.warmup_done:
             return
-        if len(all_bars) < STREAK_SIZE + 1:
-            return
-
         sig = self._check_signal(all_bars)
         if sig == 0:
             return
-
         self._open_position(sig, bar)
 
-    # ── MT5 EXECUTION ────────────────────────────────────────────
+    # ── MT5 EXECUTION ──────────────────────────────────────────
 
     def _send_mt5_order(self, pos):
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick is None:
+        t = mt5.symbol_info_tick(SYMBOL)
+        if t is None:
             print("[MT5] no tick, order aborted")
             return
-        price = tick.ask if pos["dir"] == 1 else tick.bid
+        price = t.ask if pos["dir"] == 1 else t.bid
         order_type = mt5.ORDER_TYPE_BUY if pos["dir"] == 1 else mt5.ORDER_TYPE_SELL
 
         req = {
@@ -475,11 +451,11 @@ class StrategyEngine:
         print(f"[MT5] #{pos['id']} filled ticket={result.order}")
 
     def _close_mt5_order(self, pos):
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick is None:
+        t = mt5.symbol_info_tick(SYMBOL)
+        if t is None:
             return
         close_type = mt5.ORDER_TYPE_SELL if pos["dir"] == 1 else mt5.ORDER_TYPE_BUY
-        price = tick.bid if pos["dir"] == 1 else tick.ask
+        price = t.bid if pos["dir"] == 1 else t.ask
         req = {
             "action":       mt5.TRADE_ACTION_DEAL,
             "symbol":       SYMBOL,
@@ -505,27 +481,21 @@ class LiveEngine:
         self.strategy = StrategyEngine()
         self.strategy._validate_fn = lambda trade: validator.validate(trade, self.bars)
         self.streamer = KokoCandleStreamer(
-            range_size=RANGE_SIZE,
-            price_decimals=PRICE_DECIMALS,
-            rev_bricks=REV_BRICKS,
-            clean_mode=CLEAN_MODE,
+            range_size=RANGE_SIZE, price_decimals=PRICE_DECIMALS,
+            rev_bricks=REV_BRICKS, clean_mode=CLEAN_MODE,
             on_bar_close=self._on_bar_close,
         )
         self.last_tick_time = 0
         self.last_price     = None
+        self.last_bid       = None
+        self.last_ask       = None
         self.lock           = threading.Lock()
         self.running        = True
+        self.tick_count     = 0
 
     def _on_bar_close(self, bar):
-        with self.lock:
-            self.bars.append(bar)
-            self.strategy.on_bar_close(bar, self.bars)
-            if not self.strategy.warmup_done and len(self.bars) >= WARMUP_BARS:
-                self.strategy.warmup_done = True
-                print(f"\n{'='*60}\n  WARMUP COMPLETE — {len(self.bars)} bars built\n  STRATEGY IS NOW LIVE\n{'='*60}\n")
-                tg.notify_warmup_done(len(self.bars), self.last_price)
-
-    # ── MT5 INIT ─────────────────────────────────────────────────
+        self.bars.append(bar)
+        self.strategy.on_bar_close(bar, self.bars)
 
     def init_mt5(self):
         if not mt5.initialize():
@@ -537,93 +507,129 @@ class LiveEngine:
             mt5.symbol_select(SYMBOL, True)
         print(f"[MT5] connected. symbol={SYMBOL} digits={info.digits} point={info.point}")
 
-    # ── WARMUP ───────────────────────────────────────────────────
+    def _feed_ticks(self, ticks):
+        """Feed a chronological array of MT5 ticks through streamer + strategy."""
+        for raw in ticks:
+            t = tick_to_price(raw)
+            if t is None: continue
+            if t["ts"] < self.last_tick_time:
+                t["ts"] = self.last_tick_time
+            self.strategy.on_tick(t)
+            self.streamer.process_tick(t)
+            self.last_tick_time = t["ts"]
+            self.last_price     = t["price"]
+            self.last_bid       = t["bid"]
+            self.last_ask       = t["ask"]
 
     def warmup(self):
-        print(f"[WARMUP] fetching last {WARMUP_LOOKBACK_DAYS}d of ticks...")
-        end   = datetime.now(timezone.utc)
-        start = end - timedelta(days=WARMUP_LOOKBACK_DAYS)
+        """Process recent ticks until we have enough bars built up to NOW.
+        After: self.bars has the most recent N bars, self.last_price is current."""
+        lookback = WARMUP_LOOKBACK_DAYS
+        attempt  = 0
+        while True:
+            attempt += 1
+            end   = datetime.now(timezone.utc)
+            start = end - timedelta(days=lookback)
+            print(f"[WARMUP attempt {attempt}] fetching last {lookback}d of ticks...")
+            ticks = mt5.copy_ticks_range(SYMBOL, start, end, mt5.COPY_TICKS_ALL)
+            if ticks is None or len(ticks) == 0:
+                raise RuntimeError(f"no ticks returned for last {lookback}d")
+            print(f"[WARMUP] {len(ticks):,} ticks → streaming through bar builder...")
 
-        ticks = mt5.copy_ticks_range(SYMBOL, start, end, mt5.COPY_TICKS_ALL)
-        if ticks is None or len(ticks) == 0:
-            raise RuntimeError("no warmup ticks returned")
+            # reset state so re-attempts don't double-process
+            self.bars = []
+            self.streamer = KokoCandleStreamer(
+                range_size=RANGE_SIZE, price_decimals=PRICE_DECIMALS,
+                rev_bricks=REV_BRICKS, clean_mode=CLEAN_MODE,
+                on_bar_close=self._on_bar_close,
+            )
+            self.last_tick_time = 0
+            self._feed_ticks(ticks)
 
-        print(f"[WARMUP] {len(ticks):,} ticks pulled, streaming through bar builder...")
-
-        for t in ticks:
-            bid = float(t["bid"])
-            ask = float(t["ask"])
-            if bid > 0 and ask > 0:
-                price = (bid + ask) / 2.0
-            elif "last" in t.dtype.names and float(t["last"]) > 0:
-                price = float(t["last"])
-            elif bid > 0:
-                price = bid
-            elif ask > 0:
-                price = ask
-            else:
-                continue
-
-            vol = float(t["volume"]) if "volume" in t.dtype.names else 0.0
-            ts  = int(t["time"])
-
-            self.streamer.process_tick({"ts": ts, "price": price, "volume": vol})
-            self.last_tick_time = ts
-            self.last_price = price
-
-            if len(self.bars) >= WARMUP_BARS and self.strategy.warmup_done:
+            if len(self.bars) >= WARMUP_BARS:
+                print(f"[WARMUP] built {len(self.bars)} bars, last_price={self.last_price}")
+                break
+            print(f"[WARMUP] only {len(self.bars)} bars from {lookback}d, extending lookback...")
+            lookback *= 2
+            if lookback > 90:
+                print(f"[WARMUP] capped at {len(self.bars)} bars; continuing live anyway")
                 break
 
-        if not self.strategy.warmup_done:
-            print(f"[WARMUP] only {len(self.bars)} bars built from {WARMUP_LOOKBACK_DAYS}d — extend lookback or wait for live")
-        else:
-            print(f"[WARMUP] done. {len(self.bars)} bars, last price={self.last_price}")
+        # trim self.bars to last (WARMUP_BARS * 2) so memory + payload stay sane
+        keep = max(WARMUP_BARS, 200)
+        if len(self.bars) > keep:
+            self.bars = self.bars[-keep:]
 
-    # ── LIVE LOOP ────────────────────────────────────────────────
+        # GAP FILL: catch any ticks that arrived during warmup processing
+        gap_start = datetime.fromtimestamp(self.last_tick_time, tz=timezone.utc)
+        gap_end   = datetime.now(timezone.utc)
+        if (gap_end - gap_start).total_seconds() > 1:
+            print(f"[WARMUP] gap-filling from {gap_start.isoformat()} → now")
+            gap = mt5.copy_ticks_range(SYMBOL, gap_start, gap_end, mt5.COPY_TICKS_ALL)
+            if gap is not None and len(gap) > 0:
+                print(f"[WARMUP] {len(gap):,} gap ticks → feeding")
+                self._feed_ticks(gap)
+
+        self.strategy.warmup_done = True
+        print(f"\n{'='*60}\n  WARMUP COMPLETE — {len(self.bars)} bars\n"
+              f"  Last price: {self.last_price}\n"
+              f"  STRATEGY IS NOW LIVE\n{'='*60}\n")
+        tg.notify_warmup_done(len(self.bars), self.last_price)
 
     def live_loop(self):
         print("[LIVE] tick poll started")
+        last_heartbeat = time.time()
+        none_count = 0
+
         while self.running:
-            tick = mt5.symbol_info_tick(SYMBOL)
-            if tick is None:
-                time.sleep(TICK_POLL_MS / 1000.0)
-                continue
+            try:
+                raw = mt5.symbol_info_tick(SYMBOL)
+            except Exception as e:
+                print(f"[LIVE-ERR] {e}")
+                time.sleep(1.0); continue
 
-            ts = int(tick.time)
-            bid, ask = float(tick.bid), float(tick.ask)
-            if bid > 0 and ask > 0:
-                price = (bid + ask) / 2.0
-            elif bid > 0:
-                price = bid
-            elif ask > 0:
-                price = ask
-            else:
-                time.sleep(TICK_POLL_MS / 1000.0)
-                continue
-            vol = float(tick.volume) if hasattr(tick, "volume") else 0.0
+            if raw is None:
+                none_count += 1
+                if none_count <= 3 or none_count % 100 == 0:
+                    print(f"[LIVE-WARN] symbol_info_tick=None (x{none_count}) — is {SYMBOL} in Market Watch?")
+                time.sleep(0.5); continue
+            none_count = 0
 
-            # dedupe: only feed if time advanced OR price changed
+            t = tick_to_price(raw)
+            if t is None:
+                time.sleep(TICK_POLL_MS / 1000.0); continue
+
+            ts, price = t["ts"], t["price"]
             if ts < self.last_tick_time:
                 ts = self.last_tick_time
             if ts == self.last_tick_time and price == self.last_price:
-                time.sleep(TICK_POLL_MS / 1000.0)
-                continue
+                time.sleep(TICK_POLL_MS / 1000.0); continue
 
-            t_obj = {"ts": ts, "price": price, "volume": vol}
             with self.lock:
-                self.strategy.on_tick(t_obj)           # SL check at tick resolution
-                self.streamer.process_tick(t_obj)      # may fire on_bar_close
+                self.strategy.on_tick(t)
+                self.streamer.process_tick(t)
 
             self.last_tick_time = ts
             self.last_price     = price
+            self.last_bid       = t["bid"]
+            self.last_ask       = t["ask"]
+            self.tick_count    += 1
+
+            now = time.time()
+            if now - last_heartbeat >= 10.0:
+                print(f"[HEARTBEAT] ticks={self.tick_count}  price={price}  "
+                      f"bars={len(self.bars)}  pos={len(self.strategy.positions)}  "
+                      f"equity=${self.strategy.equity:.2f}")
+                last_heartbeat = now
 
             time.sleep(TICK_POLL_MS / 1000.0)
 
     def snapshot(self):
         with self.lock:
             working = self.streamer.get_working_bar()
+            chart_bars = self.bars[-CHART_MAX_BARS:] if len(self.bars) > CHART_MAX_BARS else self.bars
             return {
-                "bars":             list(self.bars),
+                "bars":             list(chart_bars),
                 "working_bar":      working,
                 "markers":          list(self.strategy.markers),
                 "trades":           list(self.strategy.trades),
@@ -635,55 +641,70 @@ class LiveEngine:
                 "balance":          round(STARTING_BALANCE + self.strategy.equity, 2),
                 "starting_balance": STARTING_BALANCE,
                 "last_price":       self.last_price,
+                "last_bid":         self.last_bid,
+                "last_ask":         self.last_ask,
+                "tick_count":       self.tick_count,
                 "symbol":           SYMBOL,
                 "live_trading":     LIVE_TRADING,
                 "config": {
-                    "range":         RANGE_SIZE,
-                    "rev":           REV_BRICKS,
-                    "clean":         CLEAN_MODE,
-                    "streak":        STREAK_SIZE,
-                    "tp":            TP_CLOSE_AFTER,
-                    "sl":            FIXED_SL_POINTS,
-                    "risk_per_100":  RISK_PER_100,
+                    "range":        RANGE_SIZE,
+                    "rev":          REV_BRICKS,
+                    "clean":        CLEAN_MODE,
+                    "streak":       STREAK_SIZE,
+                    "tp":           TP_CLOSE_AFTER,
+                    "sl":           FIXED_SL_POINTS,
+                    "risk_per_100": RISK_PER_100,
                 },
             }
-        
 
 
 # ============================ FLASK ============================
 
 engine = LiveEngine()
-app = Flask(__name__, static_folder=".", static_url_path="")
+app = Flask(__name__)
 
 @app.route("/")
 def index():
     return send_from_directory(".", "chart.html")
 
+@app.route("/lightweight-charts.standalone.production.js")
+def lwc_lib():
+    return send_from_directory(".", "lightweight-charts.standalone.production.js")
+
 @app.route("/api/state")
 def state():
     return jsonify(engine.snapshot())
+
+@app.route("/api/debug")
+def debug():
+    return jsonify({
+        "running":          engine.running,
+        "warmup_done":      engine.strategy.warmup_done,
+        "bar_count":        len(engine.bars),
+        "tick_count":       engine.tick_count,
+        "last_tick_time":   engine.last_tick_time,
+        "last_tick_dt_utc": datetime.fromtimestamp(engine.last_tick_time, tz=timezone.utc).isoformat() if engine.last_tick_time else None,
+        "last_price":       engine.last_price,
+        "now_utc":          datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # ============================ MAIN ============================
 
 def main():
-    print("="*60)
+    print("=" * 60)
     print(f"  KOKO LIVE ENGINE — {SYMBOL} {RANGE_SIZE}pt  |  LIVE_TRADING={LIVE_TRADING}")
-    print("="*60)
+    print("=" * 60)
 
     engine.init_mt5()
+
     tg.notify_start(
-        symbol=SYMBOL,
-        range_size=RANGE_SIZE,
-        rev=REV_BRICKS,
-        clean=CLEAN_MODE,
-        streak=STREAK_SIZE,
-        tp=TP_CLOSE_AFTER,
-        sl=FIXED_SL_POINTS,
-        starting_balance=STARTING_BALANCE,
-        risk_per_100=RISK_PER_100,
+        symbol=SYMBOL, range_size=RANGE_SIZE, rev=REV_BRICKS, clean=CLEAN_MODE,
+        streak=STREAK_SIZE, tp=TP_CLOSE_AFTER, sl=FIXED_SL_POINTS,
+        starting_balance=STARTING_BALANCE, risk_per_100=RISK_PER_100,
         live_trading=LIVE_TRADING,
     )
+
     engine.warmup()
 
     t = threading.Thread(target=engine.live_loop, daemon=True)
@@ -691,7 +712,7 @@ def main():
 
     print(f"[WEB] chart → http://localhost:{HTTP_PORT}")
     try:
-        app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False)
+        app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False, threaded=True)
     finally:
         engine.running = False
         mt5.shutdown()

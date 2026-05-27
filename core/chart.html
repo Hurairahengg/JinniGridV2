@@ -2,22 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Koko Live — USTEC</title>
+<title>Koko Live</title>
+<script src="/lightweight-charts.standalone.production.js"></script>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e10; color: #e6e6e6;
                font-family: -apple-system, system-ui, sans-serif; height: 100%; overflow: hidden; }
   #header { padding: 8px 14px; background: #161618; border-bottom: 1px solid #2a2a2e;
-            display: flex; gap: 18px; align-items: center; font-size: 13px; flex-wrap: wrap; }
-  #header .tag  { padding: 2px 8px; background: #2a2a2e; border-radius: 4px; font-size: 11px; }
-  #header .live { color: #4caf50; font-weight: 700; }
-  #header .sim  { color: #ffb74d; font-weight: 700; }
-  #header .warm { color: #ef5350; font-weight: 700; }
-  #header .eq-pos { color: #4caf50; }
-  #header .eq-neg { color: #ef5350; }
+            display: flex; gap: 14px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+  .tag    { padding: 2px 8px; background: #2a2a2e; border-radius: 4px; font-size: 11px; }
+  .live   { color: #4caf50; font-weight: 700; }
+  .sim    { color: #ffb74d; font-weight: 700; }
+  .warm   { color: #ef5350; font-weight: 700; }
+  .pos    { color: #4caf50; }
+  .neg    { color: #ef5350; }
   #chart  { width: 100%; height: calc(100vh - 90px); }
   #footer { padding: 6px 14px; background: #161618; border-top: 1px solid #2a2a2e;
-            font-size: 11px; color: #888; display: flex; gap: 18px; flex-wrap: wrap; }
-  #errbox { color: #ef5350; padding: 20px; font-family: monospace; }
+            font-size: 11px; color: #888; display: flex; gap: 14px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -27,12 +27,13 @@
   <span class="tag" id="cfg">…</span>
   <span class="tag" id="mode">…</span>
   <span class="tag" id="warm">…</span>
-  <span>Price: <b id="price">—</b></span>
-  <span>Bars: <b id="barcount">0</b></span>
-  <span>Trades: <b id="trades">0</b></span>
-  <span>Equity: <b id="equity">$0.00</b></span>
-  <span>Balance: <b id="balance">$0.00</b></span>
-  <span>Validator: <b id="valstat">—</b></span>
+  <span>Price <b id="price">—</b></span>
+  <span>Bars <b id="barcount">0</b></span>
+  <span>Ticks <b id="tickcount">0</b></span>
+  <span>Trades <b id="trades">0</b></span>
+  <span>Equity <b id="equity">$0.00</b></span>
+  <span>Balance <b id="balance">$0.00</b></span>
+  <span>Validator <b id="valstat">—</b></span>
   <span id="pos-info"></span>
 </div>
 
@@ -44,198 +45,146 @@
 </div>
 
 <script>
-// ============================================================
-// BOOTSTRAP: try to load LightweightCharts from multiple CDNs
-// ============================================================
-const CDN_URLS = [
-  "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js",
-  "https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js",
-  "https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.1.3/lightweight-charts.standalone.production.js",
-];
-
-function loadScript(url) {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = url;
-    s.onload  = () => { console.log("[CDN OK]", url); resolve(); };
-    s.onerror = () => { console.warn("[CDN FAIL]", url); reject(new Error(url)); };
-    document.head.appendChild(s);
-  });
+if (typeof LightweightCharts === "undefined") {
+  document.body.innerHTML =
+    "<div style='color:#ef5350;padding:20px;font-family:monospace;font-size:14px'>" +
+    "❌ <b>LightweightCharts library failed to load.</b><br><br>" +
+    "Make sure <code>lightweight-charts.standalone.production.js</code> is in the same folder as <code>live_engine.py</code>.<br><br>" +
+    "Download it:<br>" +
+    "<code>curl -O https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js</code><br><br>" +
+    "Verify Flask can serve it by opening:<br>" +
+    "<a href='/lightweight-charts.standalone.production.js' style='color:#42a5f5'>http://localhost:5000/lightweight-charts.standalone.production.js</a></div>";
+  throw new Error("lib not loaded");
 }
 
-async function tryLoadLib() {
-  for (const url of CDN_URLS) {
-    try { await loadScript(url); return true; }
-    catch (e) { continue; }
+const chartEl = document.getElementById("chart");
+const chart = LightweightCharts.createChart(chartEl, {
+  width:  chartEl.clientWidth,
+  height: chartEl.clientHeight,
+  layout: { background: { type: "solid", color: "#0e0e10" }, textColor: "#cccccc" },
+  grid:   { vertLines: { color: "#1c1c1f" }, horzLines: { color: "#1c1c1f" } },
+  rightPriceScale: { borderColor: "#2a2a2e" },
+  timeScale: { borderColor: "#2a2a2e", timeVisible: true, secondsVisible: true },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+});
+
+const candles = chart.addCandlestickSeries({
+  upColor: "#4caf50", downColor: "#ef5350",
+  borderUpColor: "#4caf50", borderDownColor: "#ef5350",
+  wickUpColor: "#4caf50", wickDownColor: "#ef5350",
+});
+
+let activeLines = [];
+function syncPriceLines(positions) {
+  for (const l of activeLines) { try { candles.removePriceLine(l); } catch(e){} }
+  activeLines = [];
+  if (!positions || positions.length === 0) return;
+  for (const p of positions) {
+    activeLines.push(candles.createPriceLine({
+      price: p.sl_price, color: "#ef5350", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: `#${p.id} SL`,
+    }));
+    activeLines.push(candles.createPriceLine({
+      price: p.entry_price, color: p.dir === 1 ? "#4caf50" : "#ef5350",
+      lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid,
+      axisLabelVisible: true, title: `#${p.id} ${p.dir === 1 ? "L" : "S"}`,
+    }));
   }
-  return false;
 }
 
-// ============================================================
-// MAIN
-// ============================================================
-async function main() {
-  document.getElementById("status").textContent = "loading chart lib...";
-  const ok = await tryLoadLib();
+window.addEventListener("resize", () => {
+  chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
+});
 
-  // even if chart lib fails, prove the API works
-  document.getElementById("status").textContent = "testing /api/state...";
+let prevBarCount = -1;
+let didFit = false;
+
+async function tick() {
   try {
     const r = await fetch("/api/state");
+    if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
-    console.log("[API OK] bars=", s.bar_count, "price=", s.last_price);
-    document.getElementById("barcount").textContent = s.bar_count;
-    document.getElementById("price").textContent = s.last_price;
-  } catch (e) {
-    document.body.innerHTML =
-      "<div id='errbox'>❌ /api/state fetch FAILED: " + e.message +
-      "<br><br>Check that live_engine.py is still running and serving on this port.</div>";
-    console.error(e); return;
-  }
 
-  if (!ok || typeof LightweightCharts === "undefined") {
-    document.body.innerHTML =
-      "<div id='errbox'>❌ Could not load LightweightCharts from any CDN.<br>" +
-      "Your network is probably blocking unpkg / jsdelivr / cdnjs.<br><br>" +
-      "Open browser DevTools → Console — you'll see which CDNs failed.<br><br>" +
-      "FIX: download the library manually:<br>" +
-      "<code>curl -O https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js</code><br>" +
-      "put it next to chart.html, then change the script src to: <code>./lightweight-charts.standalone.production.js</code></div>";
-    return;
-  }
+    document.getElementById("sym").textContent = s.symbol;
+    document.getElementById("cfg").textContent =
+      `${s.config.range}pt | rev${s.config.rev}x | streak${s.config.streak} | tp${s.config.tp} | SL${s.config.sl}pt`;
 
-  document.getElementById("status").textContent = "starting chart...";
-  console.log("[INIT] LightweightCharts version:", LightweightCharts.version ? LightweightCharts.version() : "?");
+    const modeEl = document.getElementById("mode");
+    modeEl.textContent = s.live_trading ? "LIVE TRADING" : "SIM MODE";
+    modeEl.className = "tag " + (s.live_trading ? "live" : "sim");
 
-  const chartEl = document.getElementById("chart");
-  const chart = LightweightCharts.createChart(chartEl, {
-    width:  chartEl.clientWidth,
-    height: chartEl.clientHeight,
-    layout: { background: { type: "solid", color: "#0e0e10" }, textColor: "#cccccc" },
-    grid:   { vertLines: { color: "#1c1c1f" }, horzLines: { color: "#1c1c1f" } },
-    rightPriceScale: { borderColor: "#2a2a2e" },
-    timeScale: { borderColor: "#2a2a2e", timeVisible: true, secondsVisible: true },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-  });
+    const warmEl = document.getElementById("warm");
+    warmEl.textContent = s.warmup_done ? "STRAT LIVE" : "WARMING UP";
+    warmEl.className = "tag " + (s.warmup_done ? "live" : "warm");
 
-  const candles = chart.addCandlestickSeries({
-    upColor: "#4caf50", downColor: "#ef5350",
-    borderUpColor: "#4caf50", borderDownColor: "#ef5350",
-    wickUpColor: "#4caf50", wickDownColor: "#ef5350",
-  });
+    document.getElementById("price").textContent     = s.last_price != null ? s.last_price.toFixed(2) : "—";
+    document.getElementById("barcount").textContent  = s.bar_count;
+    document.getElementById("tickcount").textContent = s.tick_count;
+    document.getElementById("trades").textContent    = s.trades.length;
 
-  let activeLines = [];
-  function syncPriceLines(positions) {
-    for (const l of activeLines) { try { candles.removePriceLine(l); } catch(e){} }
-    activeLines = [];
-    if (!positions || positions.length === 0) return;
-    for (const p of positions) {
-      activeLines.push(candles.createPriceLine({
-        price: p.sl_price, color: "#ef5350", lineWidth: 1,
-        lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: true, title: `#${p.id} SL`,
-      }));
-      activeLines.push(candles.createPriceLine({
-        price: p.entry_price, color: p.dir === 1 ? "#4caf50" : "#ef5350",
-        lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true, title: `#${p.id} ${p.dir === 1 ? "L" : "S"}`,
-      }));
+    const eqEl = document.getElementById("equity");
+    eqEl.textContent = `$${s.equity.toFixed(2)}`;
+    eqEl.className = s.equity >= 0 ? "pos" : "neg";
+
+    document.getElementById("balance").textContent = `$${s.balance.toFixed(2)}`;
+
+    if (s.validations && s.validations.length > 0) {
+      const match = s.validations.filter(v => v.status === "MATCH").length;
+      const mis   = s.validations.filter(v => v.status === "MISMATCH").length;
+      const skip  = s.validations.filter(v => v.status === "SKIP").length;
+      const pct   = ((match / s.validations.length) * 100).toFixed(1);
+      document.getElementById("valstat").innerHTML =
+        `<span class="${mis>0?'neg':'pos'}">${match}/${s.validations.length} (${pct}%)</span>` +
+        (mis ? ` <span class="neg">❌${mis}</span>` : "") +
+        (skip ? ` <span style="color:#888">⚪${skip}</span>` : "");
     }
-  }
 
-  window.addEventListener("resize", () => {
-    chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
-  });
+    const posInfo = document.getElementById("pos-info");
+    if (s.positions && s.positions.length > 0) {
+      posInfo.innerHTML = s.positions.map(p => {
+        const dirTxt = p.dir === 1 ? "L" : "S";
+        const bg = p.dir === 1 ? "#1b3a1f" : "#3a1b1b";
+        return `<span class="tag" style="background:${bg};margin-right:4px;">` +
+          `#${p.id} ${dirTxt} ${p.entry_price.toFixed(2)} SL${p.sl_price.toFixed(2)} ${p.bars_held}/${s.config.tp + 1} ${p.lots}lot` +
+          `</span>`;
+      }).join("");
+    } else { posInfo.innerHTML = ""; }
 
-  let prevBarCount = -1;
-  let didFit = false;
+    const data = s.bars.map(b => ({
+      time: b.time, open: b.open, high: b.high, low: b.low, close: b.close,
+    }));
+    if (s.working_bar) data.push({
+      time: s.working_bar.time, open: s.working_bar.open,
+      high: s.working_bar.high, low: s.working_bar.low, close: s.working_bar.close,
+    });
 
-  async function tick() {
-    try {
-      const r = await fetch("/api/state");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const s = await r.json();
-
-      document.getElementById("sym").textContent = s.symbol;
-      document.getElementById("cfg").textContent =
-        `${s.config.range}pt | rev${s.config.rev}x | streak${s.config.streak} | tp${s.config.tp} | SL${s.config.sl}`;
-
-      const modeEl = document.getElementById("mode");
-      modeEl.textContent = s.live_trading ? "LIVE TRADING" : "SIM MODE";
-      modeEl.className = "tag " + (s.live_trading ? "live" : "sim");
-
-      const warmEl = document.getElementById("warm");
-      warmEl.textContent = s.warmup_done ? "STRAT LIVE" : "WARMING UP";
-      warmEl.className = "tag " + (s.warmup_done ? "live" : "warm");
-
-      document.getElementById("price").textContent = s.last_price != null ? s.last_price.toFixed(2) : "—";
-      document.getElementById("barcount").textContent = s.bar_count;
-      document.getElementById("trades").textContent = s.trades.length;
-
-      const eqEl = document.getElementById("equity");
-      eqEl.textContent = `$${s.equity.toFixed(2)}`;
-      eqEl.className = s.equity >= 0 ? "eq-pos" : "eq-neg";
-
-      document.getElementById("balance").textContent = `$${(s.balance || 0).toFixed(2)}`;
-
-      if (s.validations && s.validations.length > 0) {
-        const match = s.validations.filter(v => v.status === "MATCH").length;
-        const mis   = s.validations.filter(v => v.status === "MISMATCH").length;
-        const skip  = s.validations.filter(v => v.status === "SKIP").length;
-        const pct   = ((match / s.validations.length) * 100).toFixed(1);
-        document.getElementById("valstat").innerHTML =
-          `<span style="color:${mis>0?'#ef5350':'#4caf50'}">${match}/${s.validations.length} (${pct}%)</span>` +
-          (mis ? ` ❌${mis}` : "") + (skip ? ` ⚪${skip}` : "");
+    if (s.bar_count !== prevBarCount) {
+      candles.setData(data);
+      candles.setMarkers(s.markers || []);
+      prevBarCount = s.bar_count;
+      if (!didFit && data.length > 0) {
+        chart.timeScale().fitContent();
+        didFit = true;
       }
-
-      const posInfo = document.getElementById("pos-info");
-      if (s.positions && s.positions.length > 0) {
-        posInfo.innerHTML = s.positions.map(p => {
-          const dirTxt = p.dir === 1 ? "L" : "S";
-          const bg = p.dir === 1 ? "#1b3a1f" : "#3a1b1b";
-          return `<span class="tag" style="background:${bg};margin-right:4px;">` +
-            `#${p.id} ${dirTxt} ${p.entry_price.toFixed(2)} SL${p.sl_price.toFixed(2)} ${p.bars_held}/${s.config.tp + 1} ${p.lots}lot` +
-            `</span>`;
-        }).join("");
-      } else { posInfo.innerHTML = ""; }
-
-      const data = s.bars.map(b => ({
-        time: b.time, open: b.open, high: b.high, low: b.low, close: b.close,
-      }));
-      if (s.working_bar) data.push({
+    } else if (s.working_bar) {
+      candles.update({
         time: s.working_bar.time, open: s.working_bar.open,
         high: s.working_bar.high, low: s.working_bar.low, close: s.working_bar.close,
       });
-
-      if (s.bar_count !== prevBarCount) {
-        candles.setData(data);
-        candles.setMarkers(s.markers || []);
-        prevBarCount = s.bar_count;
-        if (!didFit && data.length > 0) {
-          chart.timeScale().fitContent();
-          didFit = true;
-        }
-      } else if (s.working_bar) {
-        candles.update({
-          time: s.working_bar.time, open: s.working_bar.open,
-          high: s.working_bar.high, low: s.working_bar.low, close: s.working_bar.close,
-        });
-      }
-
-      syncPriceLines(s.positions);
-      document.getElementById("status").textContent = "OK";
-      document.getElementById("last-update").textContent = "Last: " + new Date().toLocaleTimeString();
-    } catch (e) {
-      document.getElementById("status").textContent = "ERR: " + e.message;
-      console.error(e);
     }
-  }
 
-  tick();
-  setInterval(tick, 500);
+    syncPriceLines(s.positions);
+    document.getElementById("status").textContent = "OK";
+    document.getElementById("last-update").textContent = "Last: " + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("status").textContent = "ERR: " + e.message;
+    console.error(e);
+  }
 }
 
-main();
+tick();
+setInterval(tick, 500);
 </script>
 </body>
 </html>
