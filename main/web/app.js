@@ -21,8 +21,18 @@ const api = {
 };
 
 const fmt = {
-  money: v => v == null ? "—" : (v >= 0 ? "+" : "") + "$" + Math.abs(Number(v)).toFixed(2),
-  big:   v => v == null ? "$0" : (v >= 0 ? "" : "-") + "$" + Math.abs(Number(v)).toLocaleString("en-US", {maximumFractionDigits: 0}),
+  money: v => {
+    if (v == null) return "—";
+    const n = Number(v);
+    const sign = n > 0 ? "+" : (n < 0 ? "-" : "");
+    return sign + "$" + Math.abs(n).toFixed(2);
+  },
+  big: v => {
+    if (v == null) return "$0";
+    const n = Number(v);
+    const sign = n < 0 ? "-" : "";
+    return sign + "$" + Math.abs(n).toLocaleString("en-US", {maximumFractionDigits: 0});
+  },
   num:   (v,d=2) => v == null ? "—" : Number(v).toFixed(d),
   pct:   v => v == null ? "—" : Number(v).toFixed(1) + "%",
   short: v => v ? new Date(v).toLocaleTimeString("en-GB", {hour12:false}).slice(0,8) : "—",
@@ -155,28 +165,31 @@ async function refreshLiveTopline() {
 function paintTopline() {
   const eq = state.liveAcct.equity;
   const fl = state.liveAcct.floating;
+
   $("#hdr-equity").textContent = fmt.big(eq);
   const fEl = $("#hdr-floating");
-  fEl.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+  fEl.textContent = fmt.money(fl);
   fEl.classList.toggle("pos", fl > 0);
   fEl.classList.toggle("neg", fl < 0);
+
   // home cells
   const balEl = $("#kpi-balance"); if (balEl) balEl.querySelector(".kc-value").textContent = fmt.big(state.liveAcct.balance);
   const eqEl  = $("#kpi-equity");  if (eqEl)  eqEl.querySelector(".kc-value").textContent = fmt.big(eq);
   const flEl  = $("#kpi-floating");
   if (flEl) {
     const v = flEl.querySelector(".kc-value");
-    v.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+    v.textContent = fmt.money(fl);
     v.classList.toggle("positive", fl > 0);
     v.classList.toggle("negative", fl < 0);
   }
+
   // portfolio cells
   const pb = $("#port-balance");  if (pb) pb.querySelector(".kc-value").textContent = fmt.big(state.liveAcct.balance);
   const pe = $("#port-equity");   if (pe) pe.querySelector(".kc-value").textContent = fmt.big(eq);
   const pf = $("#port-floating");
   if (pf) {
     const v = pf.querySelector(".kc-value");
-    v.textContent = (fl >= 0 ? "+" : "") + "$" + Math.abs(fl).toFixed(2);
+    v.textContent = fmt.money(fl);
     v.classList.toggle("positive", fl > 0);
     v.classList.toggle("negative", fl < 0);
   }
@@ -216,14 +229,40 @@ function toast(kind, msg) {
 
 // ═══ CHART OPTS ═══
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function hexToRgba(hex, alpha) {
+  hex = (hex || "").trim().replace("#", "");
+  if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
+  if (hex.length !== 6) return `rgba(140,140,140,${alpha})`;
+  const r = parseInt(hex.slice(0,2), 16);
+  const g = parseInt(hex.slice(2,4), 16);
+  const b = parseInt(hex.slice(4,6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+function themeRgba(varName, alpha) {
+  const v = cssVar(varName);
+  if (v.startsWith("#")) return hexToRgba(v, alpha);
+  if (v.startsWith("rgb")) {
+    // already rgb / rgba — coerce to rgba with new alpha
+    const m = v.match(/rgba?\(([^)]+)\)/);
+    if (m) {
+      const parts = m[1].split(",").map(s => s.trim());
+      return `rgba(${parts[0]},${parts[1]},${parts[2]},${alpha})`;
+    }
+  }
+  return `rgba(140,140,140,${alpha})`;
+}
+
 function chartBaseOpts(el) {
   return {
-    width: el ? el.clientWidth : 600,
+    width:  el ? el.clientWidth  : 600,
     height: el ? el.clientHeight : 300,
     layout: { background: { color: "transparent" }, textColor: cssVar("--text-2"), fontFamily: "JetBrains Mono", fontSize: 11 },
-    grid: { vertLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" }, horzLines: { color: "color-mix(in srgb, " + cssVar("--text-2") + " 8%, transparent)" } },
-    rightPriceScale: { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)" },
-    timeScale:       { borderColor: "color-mix(in srgb, " + cssVar("--text-2") + " 14%, transparent)", timeVisible: true, secondsVisible: false },
+    grid: {
+      vertLines: { color: themeRgba("--text-2", 0.08) },
+      horzLines: { color: themeRgba("--text-2", 0.08) },
+    },
+    rightPriceScale: { borderColor: themeRgba("--text-2", 0.14) },
+    timeScale:       { borderColor: themeRgba("--text-2", 0.14), timeVisible: true, secondsVisible: false },
     crosshair: { mode: 1 },
   };
 }
@@ -282,7 +321,7 @@ async function loadHome() {
         </div>
         <div class="pulse-right">
           <div class="pulse-balance">${w.last_equity != null ? "$" + Number(w.last_equity).toFixed(0) : "—"}</div>
-          ${fl != null ? `<div class="pulse-floating ${fl>=0?"pos":"neg"}">${fl>=0?"+":""}${fl.toFixed(2)}</div>` : ""}
+          ${fl != null ? `<div class="pulse-floating ${fl>=0?"pos":"neg"}">${fmt.money(fl)}</div>` : ""}
         </div>
       </div>`;
   }).join("") || `<div class="pos-empty">no workers registered</div>`;
@@ -312,7 +351,7 @@ function refreshOpenPositions() {
           <div class="pos-sub">${w.open_positions} position${w.open_positions>1?"s":""} · ${w.broker || ""}</div>
         </div>
         <div class="pos-price">${w.last_equity != null ? "$"+Number(w.last_equity).toFixed(2) : "—"}</div>
-        <div>${fl != null ? `<span class="pos-dir ${fl>=0?"LONG":"SHORT"}">${fl>=0?"+":""}${fl.toFixed(2)}</span>` : "—"}</div>
+        <div>${fl != null ? `<span class="pos-dir ${fl>=0?"LONG":"SHORT"}">${fmt.money(fl)}</span>` : "—"}</div>
       </div>`;
   }).join("");
 }
@@ -381,8 +420,8 @@ function renderLiveAccountChart(perWorker) {
     });
     equitySeries = liveAccountChart.addAreaSeries({
       lineColor: cssVar("--success"),
-      topColor: "color-mix(in srgb, " + cssVar("--success") + " 22%, transparent)",
-      bottomColor: "color-mix(in srgb, " + cssVar("--success") + " 0%, transparent)",
+      topColor: themeRgba("--success", 0.22),
+      bottomColor: themeRgba("--success", 0.0),
       lineWidth: 2,
       priceLineVisible: false, lastValueVisible: true,
     });
@@ -417,17 +456,23 @@ let portDdChart = null, portDdSeries = null;
 let portHistChart = null, portHistSeries = null;
 
 async function loadPortfolio() {
-  const [p, equity, live] = await Promise.all([
-    api.get("/api/portfolio"), api.get("/api/equity"), api.get("/api/equity_live"),
-  ]);
-  state.liveAcct = { balance: live.total_balance, equity: live.total_equity, floating: live.total_floating };
-  paintTopline();
-  renderMetrics(p);
-  renderPortfolioEquity(equity);
-  renderDrawdown(equity);
-  renderByWorker(p.by_worker || []);
-  renderHistogram(equity);
-  loadTrades();
+  let p = null, equity = [], live = null;
+  try { p      = await api.get("/api/portfolio");    } catch (e) { console.error("portfolio failed:", e); toast("error", "portfolio failed: " + e.message); }
+  try { equity = await api.get("/api/equity");       } catch (e) { console.error("equity failed:", e); }
+  try { live   = await api.get("/api/equity_live");  } catch (e) { console.error("equity_live failed:", e); }
+
+  if (live) {
+    state.liveAcct = { balance: live.total_balance, equity: live.total_equity, floating: live.total_floating };
+    paintTopline();
+  }
+
+  // each render in its own try so one failure doesn't kill the rest
+  if (p) { try { renderMetrics(p); } catch (e) { console.error("renderMetrics:", e); } }
+  try { renderPortfolioEquity(equity); } catch (e) { console.error("renderPortfolioEquity:", e); }
+  try { renderDrawdown(equity); }       catch (e) { console.error("renderDrawdown:", e); }
+  if (p) { try { renderByWorker(p.by_worker || []); } catch (e) { console.error("renderByWorker:", e); } }
+  try { renderHistogram(equity); }      catch (e) { console.error("renderHistogram:", e); }
+  try { await loadTrades(); }           catch (e) { console.error("loadTrades:", e); toast("error", "trades failed: " + e.message); }
 }
 async function refreshPortfolioLive() {
   const live = await api.get("/api/equity_live");
@@ -436,6 +481,22 @@ async function refreshPortfolioLive() {
 }
 
 function renderMetrics(p) {
+  p = p || {};
+  // defensive defaults so missing fields don't throw
+  const safe = (v, d=0) => (v == null || Number.isNaN(v)) ? d : v;
+  p = {
+    n_trades: safe(p.n_trades), wins: safe(p.wins), losses: safe(p.losses),
+    win_rate: safe(p.win_rate), net_pnl: safe(p.net_pnl),
+    profit_factor: safe(p.profit_factor), expectancy: safe(p.expectancy),
+    avg_win: safe(p.avg_win), avg_loss: safe(p.avg_loss),
+    best_trade: safe(p.best_trade), worst_trade: safe(p.worst_trade),
+    max_drawdown: safe(p.max_drawdown), max_dd_pct: safe(p.max_dd_pct),
+    sharpe: safe(p.sharpe), avg_r: safe(p.avg_r), avg_bars_held: safe(p.avg_bars_held),
+    longest_win_streak: safe(p.longest_win_streak),
+    longest_loss_streak: safe(p.longest_loss_streak),
+    current_streak: safe(p.current_streak), current_streak_kind: p.current_streak_kind || "—",
+    total_commission: safe(p.total_commission), by_worker: p.by_worker || [],
+  };
   const cell = (label, value, sub, kind="") => `
     <div class="metric">
       <div class="metric-label">${label}</div>
@@ -467,14 +528,15 @@ function renderMetrics(p) {
 
 function renderPortfolioEquity(equity) {
   const el = $("#port-equity-chart"); if (!el) return;
+  if (!Array.isArray(equity)) equity = [];
   if (!portEquityChart) {
     portEquityChart = LightweightCharts.createChart(el, {
       ...chartBaseOpts(el), handleScroll: false, handleScale: false,
     });
     portEquitySeries = portEquityChart.addAreaSeries({
       lineColor: cssVar("--success"),
-      topColor: "color-mix(in srgb, " + cssVar("--success") + " 30%, transparent)",
-      bottomColor: "color-mix(in srgb, " + cssVar("--success") + " 0%, transparent)",
+      topColor: themeRgba("--success", 0.30),
+      bottomColor: themeRgba("--success", 0.0),
       lineWidth: 2,
     });
     new ResizeObserver(() => { portEquityChart.resize(el.clientWidth, el.clientHeight); portEquityChart.timeScale().fitContent(); }).observe(el);
@@ -492,8 +554,8 @@ function renderDrawdown(equity) {
     });
     portDdSeries = portDdChart.addAreaSeries({
       lineColor: cssVar("--danger"),
-      topColor: "color-mix(in srgb, " + cssVar("--danger") + " 2%, transparent)",
-      bottomColor: "color-mix(in srgb, " + cssVar("--danger") + " 30%, transparent)",
+      topColor: themeRgba("--danger", 0.02),
+      bottomColor: themeRgba("--danger", 0.30),
       lineWidth: 2,
     });
     new ResizeObserver(() => { portDdChart.resize(el.clientWidth, el.clientHeight); portDdChart.timeScale().fitContent(); }).observe(el);
@@ -569,7 +631,7 @@ async function loadFleet() {
           <div class="stat-cell"><label>account</label><b>${w.account || "—"}</b></div>
           <div class="stat-cell"><label>balance</label><b>${w.last_balance != null ? "$"+Number(w.last_balance).toFixed(2) : "—"}</b></div>
           <div class="stat-cell"><label>equity</label><b>${w.last_equity  != null ? "$"+Number(w.last_equity).toFixed(2)  : "—"}</b></div>
-          <div class="stat-cell"><label>floating</label>${fl != null ? `<b class="${fl>=0?'pos':'neg'}">${fl>=0?"+":""}$${fl.toFixed(2)}</b>` : "<b>—</b>"}</div>
+          <div class="stat-cell"><label>floating</label>${fl != null ? `<b class="${fl>=0?'pos':'neg'}">${fmt.money(fl)}</b>` : "<b>—</b>"}</div><div class="stat-cell"><label>floating</label>${fl != null ? `<b class="${fl>=0?'pos':'neg'}">${fl>=0?"+":""}$${fl.toFixed(2)}</b>` : "<b>—</b>"}</div>
           <div class="stat-cell"><label>positions</label><b>${w.open_positions ?? 0}</b></div>
           <div class="stat-cell"><label>bars in mem</label><b>${w.mem_bars ?? 0}</b></div>
           <div class="stat-cell"><label>last hb</label><b>${w.last_heartbeat ? fmt.short(w.last_heartbeat) : "—"}</b></div>
