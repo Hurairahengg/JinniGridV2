@@ -51,15 +51,18 @@ def _ts_fmt(ts):
 
 # ============================ MESSAGE TEMPLATES ============================
 
-def notify_start(symbol, range_size, rev, clean, streak, tp, sl, risk, live_trading):
+def notify_start(symbol, range_size, rev, clean, streak, tp, sl,
+                 starting_balance, risk_per_100, live_trading):
     mode = "🔴 *LIVE TRADING*" if live_trading else "🟡 *SIM MODE*"
+    initial_risk = (starting_balance / 100.0) * risk_per_100
     text = (
         f"🚀 *KOKO ENGINE STARTED*\n"
         f"{mode}\n\n"
         f"*Symbol:* `{symbol}`\n"
         f"*Bars:* `{range_size}pt | rev {rev}x | clean {'ON' if clean else 'OFF'}`\n"
         f"*Strategy:* `streak={streak}, tp={tp}, SL={sl}pt`\n"
-        f"*Risk:* `${risk}/trade`\n"
+        f"*Balance:* `${starting_balance:.2f}`\n"
+        f"*Risk:* `${risk_per_100}/100 → ${initial_risk:.2f}/trade`\n"
         f"_started {_ts_fmt(int(datetime.now(timezone.utc).timestamp()))}_"
     )
     _send(text)

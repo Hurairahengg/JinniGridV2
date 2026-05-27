@@ -680,7 +680,8 @@ def main():
         streak=STREAK_SIZE,
         tp=TP_CLOSE_AFTER,
         sl=FIXED_SL_POINTS,
-        risk=FLAT_RISK_DOLLARS,
+        starting_balance=STARTING_BALANCE,
+        risk_per_100=RISK_PER_100,
         live_trading=LIVE_TRADING,
     )
     engine.warmup()
