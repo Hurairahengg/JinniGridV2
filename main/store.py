@@ -313,7 +313,7 @@ def portfolio_stats():
         "net_pnl":             round(net, 2),
         "gross_pnl":           round(net + commission, 2),
         "total_commission":    round(commission, 2),
-        "profit_factor":       round(gross_win / gross_loss, 2) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0),
+        "profit_factor":       round(gross_win / gross_loss, 2) if gross_loss > 0 else (999.99 if gross_win > 0 else 0.0),
         "avg_win":             round(sum(wins) / len(wins), 2) if wins else 0.0,
         "avg_loss":            round(sum(losses) / len(losses), 2) if losses else 0.0,
         "avg_trade":           round(net / n, 2),

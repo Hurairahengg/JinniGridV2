@@ -9,8 +9,21 @@ import asyncio
 import uvicorn
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+import math, json as _json
+
+def _safe_default(o):
+    if isinstance(o, float):
+        if math.isinf(o): return 999999.99 if o > 0 else -999999.99
+        if math.isnan(o): return 0.0
+    raise TypeError(f"not serializable: {type(o)}")
+
+class SafeJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return _json.dumps(content, default=_safe_default, allow_nan=False,
+                           ensure_ascii=False).encode("utf-8")
 
 import store
 from fleet import fleet, load_config, save_config, list_configs
@@ -19,7 +32,7 @@ WEB_DIR = Path(__file__).parent / "web"
 HOST = "0.0.0.0"
 PORT = 5000
 
-app = FastAPI(title="Jinni Grid — Mother")
+app = FastAPI(title="Jinni Grid — Mother", default_response_class=SafeJSONResponse)
 
 
 # ═══════════════════════════════════════════════════════════════

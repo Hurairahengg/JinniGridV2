@@ -373,7 +373,7 @@ function renderMetrics(p) {
   $("#metric-grid").innerHTML = [
     cell("Net PnL",        fmt.big(p.net_pnl),                       `${p.n_trades} trades`, pnlKind),
     cell("Win Rate",       fmt.pct(p.win_rate),                       `${p.wins} W · ${p.losses} L`),
-    cell("Profit Factor",  isFinite(p.profit_factor) ? p.profit_factor.toFixed(2) : "∞", "gross win / gross loss"),
+    cell("Profit Factor",  p.profit_factor >= 999 ? "∞" : p.profit_factor.toFixed(2), "gross win / gross loss"),
     cell("Expectancy",     fmt.money(p.expectancy),                    "avg per trade", p.expectancy > 0 ? "pos" : (p.expectancy < 0 ? "neg" : "")),
     cell("Avg Win",        fmt.money(p.avg_win),                       "per winning trade", "pos"),
     cell("Avg Loss",       fmt.money(p.avg_loss),                      "per losing trade",  "neg"),
