@@ -1,157 +1,133 @@
 """
-telegram_bot.py — Notifications module
-Imported by live_engine.py and validator.py
+Telegram notifier for Koko Live Engine.
+Fire-and-forget HTTP — never blocks the tick loop.
+
+Setup:
+    1. Talk to @BotFather on Telegram → /newbot → grab the token
+    2. Talk to @userinfobot → grab your chat_id (or your group's)
+    3. Fill BOT_TOKEN and CHAT_ID below
+    4. Import in live_engine.py and call the helpers
 """
 
+import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
-# ─── FILL THESE IN ────────────────────────────────────────────────
+# ============================ CONFIG ============================
+
 BOT_TOKEN = '7320016249:AAH9wV_QttEVNnzlWw5wiqIvjWNgC1TQ4ow'  
 CHAT_ID = '-5124585879'
-# ──────────────────────────────────────────────────────────────────
+ENABLED   = True
+TIMEOUT   = 5        # seconds
 
-ENABLED = True   # set False to silence
-
+# ============================ CORE ============================
 
 def _send(text):
+    """Send markdown msg in a background thread so it can't stall ticks."""
     if not ENABLED:
         return
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=8)
-        if r.status_code != 200:
-            print(f"[telegram] HTTP {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"[telegram] send failed: {e}")
+    if BOT_TOKEN.startswith("PASTE") or CHAT_ID.startswith("PASTE"):
+        print(f"[TG-SKIP] {text.splitlines()[0]}")
+        return
 
+    def _do():
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            r = requests.post(url, json={
+                "chat_id":    CHAT_ID,
+                "text":       text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }, timeout=TIMEOUT)
+            if r.status_code != 200:
+                print(f"[TG-ERR] {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"[TG-ERR] {e}")
 
-def send_status(msg):
-    _send(f"ℹ️ <b>STATUS</b>\n<code>{msg}</code>")
+    threading.Thread(target=_do, daemon=True).start()
 
+def _ts_fmt(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def send_boot(config):
-    """Fancy boot banner sent once when live engine starts."""
-    risk_line = (
-        f"SCALING 🔄 (live balance)"
-        if config["scaling_enabled"]
-        else f"FIXED 🔒 (base ${config['starting_balance']:.2f})"
+# ============================ MESSAGE TEMPLATES ============================
+
+def notify_start(symbol, range_size, rev, clean, streak, tp, sl, risk, live_trading):
+    mode = "🔴 *LIVE TRADING*" if live_trading else "🟡 *SIM MODE*"
+    text = (
+        f"🚀 *KOKO ENGINE STARTED*\n"
+        f"{mode}\n\n"
+        f"*Symbol:* `{symbol}`\n"
+        f"*Bars:* `{range_size}pt | rev {rev}x | clean {'ON' if clean else 'OFF'}`\n"
+        f"*Strategy:* `streak={streak}, tp={tp}, SL={sl}pt`\n"
+        f"*Risk:* `${risk}/trade`\n"
+        f"_started {_ts_fmt(int(datetime.now(timezone.utc).timestamp()))}_"
     )
-    msg = (
-        f"╔═══════════════════════════╗\n"
-        f"   🤖 <b>JINNI LIVE — ONLINE</b>\n"
-        f"╚═══════════════════════════╝\n"
-        f"\n"
-        f"⚡️ <b>System booted successfully</b>\n"
-        f"<i>{config['boot_time']}</i>\n"
-        f"\n"
-        f"━━━━━━━━ <b>MARKET</b> ━━━━━━━━\n"
-        f"📊 Symbol:      <code>{config['symbol']}</code>\n"
-        f"🧱 Bars:        <code>{config['brick']}pt Koko</code>  (rev={config['rev']}, clean=OFF)\n"
-        f"💾 Memory:      <code>max {config['max_bars']} bars</code>\n"
-        f"\n"
-        f"━━━━━━━ <b>STRATEGY</b> ━━━━━━━\n"
-        f"🎯 Streak:      <code>{config['streak']}</code>\n"
-        f"⏱  TP after:    <code>{config['tp']} bars</code>\n"
-        f"🛡  Stop loss:   <code>{config['sl']}pt</code>\n"
-        f"\n"
-        f"━━━━━━━━━ <b>RISK</b> ━━━━━━━━━\n"
-        f"💰 Model:       {risk_line}\n"
-        f"📈 Risk/$100:   <code>${config['rp100']:.2f}</code>  ({config['rp100']}%)\n"
-        f"💵 Pt value:    <code>${config['pt_value']}/pt/lot</code>\n"
-        f"\n"
-        f"━━━━━━━━ <b>COSTS</b> ━━━━━━━━━\n"
-        f"💸 Commission:  <code>${config['commission']}/lot</code>\n"
-        f"🌀 Slippage:    <code>{config['slippage']}pt</code>\n"
-        f"\n"
-        f"🟢 <b>Status:</b> waiting for warmup…\n"
-        f"📡 <b>Mode:</b> tick stream from MT5\n"
-        f"\n"
+    _send(text)
+
+def notify_warmup_done(bar_count, last_price):
+    _send(
+        f"✅ *WARMUP COMPLETE*\n"
+        f"Built `{bar_count}` bars\n"
+        f"Last price: `{last_price}`\n"
+        f"*Strategy is now LIVE.*"
     )
-    _send(msg)
 
-
-def send_warmup_done(bar_count, in_memory):
-    msg = (
-        f"✅ <b>WARMUP COMPLETE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 Bars built:    <code>{bar_count}</code>\n"
-        f"💾 In memory:     <code>{in_memory}</code>\n"
-        f"\n"
-        f"🚀 <b>Engine is LIVE</b>"
+def notify_entry(trade_id, direction, entry, sl, lots, bar_time, position_count):
+    side = "🟢 LONG" if direction == 1 else "🔴 SHORT"
+    text = (
+        f"*{side} OPENED* `#{trade_id}`\n"
+        f"*Entry:* `{entry:.1f}`\n"
+        f"*SL:* `{sl:.1f}` ({abs(entry-sl):.1f}pt)\n"
+        f"*Lots:* `{lots}`\n"
+        f"*Open positions:* `{position_count}`\n"
+        f"_{_ts_fmt(bar_time)}_"
     )
-    _send(msg)
-def send_error(msg):
-    _send(f"🚨 <b>ERROR</b>\n<code>{msg}</code>")
+    _send(text)
 
-
-def send_signal(trade):
-    """Called the moment a trade is opened."""
-    dir_emoji = "🟢 LONG" if trade["dir"] == 1 else "🔴 SHORT"
-    msg = (
-        f"⚡️ <b>TRADE OPENED — {dir_emoji}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Symbol:</b> <code>{trade['symbol']}</code>\n"
-        f"<b>Entry:</b>  <code>{trade['actual_entry']:.2f}</code>\n"
-        f"<b>SL:</b>     <code>{trade['sl_price']:.2f}</code>  ({trade['sl_pts']:.1f}pt)\n"
-        f"<b>Lots:</b>   <code>{trade['lots']:.2f}</code>\n"
-        f"<b>Risk:</b>   <code>${trade['risk_used']:.2f}</code>\n"
-        f"<b>Time:</b>   <code>{trade['entry_time']}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Streak bars: {trade.get('streak_summary','')}\n"
-        f"Reversal:    {trade.get('reversal_summary','')}"
-    )
-    _send(msg)
-
-
-def send_close(trade, verdict):
-    """Called when a trade closes (TP/SL). Includes validator verdict."""
-    pnl = trade["net_pnl"]
-    pnl_emoji = "✅" if pnl > 0 else "❌"
-    reason = "🎯 TP" if not trade["hit_sl"] else "🛑 SL"
-
-    if verdict["match"]:
-        v_emoji = "✅"
-        v_line = (
-            f"<b>Backtest match:</b> ✅ <code>OK</code>\n"
-            f"Expected PnL: <code>${verdict['expected_pnl']:.2f}</code>  "
-            f"(diff <code>${verdict['pnl_diff']:+.2f}</code> / "
-            f"<code>{verdict['pnl_diff_pct']:+.2f}%</code>)"
-        )
+def notify_exit(trade_id, direction, entry, exit_px, net_pnl, reason, bars_held, equity, position_count):
+    side_txt = "LONG" if direction == 1 else "SHORT"
+    if reason == "TP":
+        emoji  = "✅"
+        result = f"*TAKE PROFIT* {emoji}"
     else:
-        v_emoji = "⚠️"
-        v_line = (
-            f"<b>Backtest match:</b> ⚠️ <code>MISMATCH</code>\n"
-            f"Expected PnL: <code>${verdict['expected_pnl']:.2f}</code>  "
-            f"Got: <code>${pnl:.2f}</code>\n"
-            f"Reason: <code>{verdict['reason']}</code>"
-        )
+        emoji  = "❌"
+        result = f"*STOP LOSS* {emoji}"
 
-    msg = (
-        f"{pnl_emoji} <b>TRADE CLOSED — {reason}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Symbol:</b>  <code>{trade['symbol']}</code>\n"
-        f"<b>Dir:</b>     <code>{'LONG' if trade['dir']==1 else 'SHORT'}</code>\n"
-        f"<b>Entry:</b>   <code>{trade['actual_entry']:.2f}</code>\n"
-        f"<b>Exit:</b>    <code>{trade['actual_exit']:.2f}</code>\n"
-        f"<b>Lots:</b>    <code>{trade['lots']:.2f}</code>\n"
-        f"<b>Points:</b>  <code>{trade['pnl_points']:+.2f}</code>\n"
-        f"<b>Gross:</b>   <code>${trade['gross_pnl']:+.2f}</code>\n"
-        f"<b>Comm:</b>    <code>-${trade['commission']:.2f}</code>\n"
-        f"<b>Net PnL:</b> <code>${pnl:+.2f}</code>\n"
-        f"<b>Bars:</b>    <code>{trade['bars_held']}</code>\n"
-        f"<b>R-mult:</b>  <code>{trade['r_multiple']:+.2f}R</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{v_line}"
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    text = (
+        f"{result} `#{trade_id}`\n"
+        f"*{side_txt}* `{entry:.1f}` → `{exit_px:.1f}`\n"
+        f"*PnL:* `{pnl_sign}${net_pnl:.2f}`\n"
+        f"*Bars held:* `{bars_held}`\n"
+        f"*Equity:* `${equity:.2f}`\n"
+        f"*Open positions:* `{position_count}`"
     )
-    _send(msg)
+    _send(text)
 
+def notify_error(msg):
+    _send(f"⚠️ *ENGINE ERROR*\n```\n{msg[:500]}\n```")
+    
+def notify_validation(v):
+    """Per-trade validator result."""
+    tid = v.get("trade_id")
+    dir_txt = "LONG" if v.get("dir") == 1 else "SHORT"
 
-if __name__ == "__main__":
-    # quick test
-    send_status("telegram_bot.py self-test")
+    if v["status"] == "MATCH":
+        text = (
+            f"✅ *VALIDATOR #{tid}* — MATCH\n"
+            f"`{dir_txt}  entryΔ={v['entry_diff_pts']:.2f}pt  exitΔ={v['exit_diff_pts']:.2f}pt`"
+        )
+    elif v["status"] == "SKIP":
+        text = (
+            f"⚪ *VALIDATOR #{tid}* — SKIP\n"
+            f"_{'; '.join(v['issues'])}_"
+        )
+    else:  # MISMATCH
+        issues = "\n".join(f"• {i}" for i in v["issues"])
+        text = (
+            f"❌ *VALIDATOR #{tid}* — MISMATCH\n"
+            f"{issues}\n\n"
+            f"*Live:*   `entry={v['live_entry']}  exit={v['live_exit']}  {v['live_reason']}  bars={v['live_bars_held']}`\n"
+            f"*Replay:* `entry={v['expected_entry']}  exit={v['expected_exit']}  {v['expected_reason']}  bars={v['expected_bars_held']}`"
+        )
+    _send(text)

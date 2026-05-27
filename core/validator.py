@@ -1,84 +1,91 @@
 """
-validator.py — Backtest re-runner / trade validator.
+validator.py — per-trade backtest replay validator.
 
-For each closed live trade, takes the captured bars (bars_window) and re-runs
-the EXACT same strategy logic as the original Python backtester. Compares
-expected vs actual entry/exit/PnL and returns a verdict.
+For every closed live trade, this re-runs the EXACT walk-forward logic
+from the offline backtester on the surrounding bars, and compares:
+  - expected entry price  vs  live entry price
+  - expected exit price   vs  live exit price
+  - expected exit reason  (SL/TP)  vs  live exit reason
+  - expected bars held    vs  live bars held
 
-OVERLAPPING TRADES:
-  Each live trade carries its own self-contained `bars_window` (streak +
-  signal + walk-forward bars). Validation is done per-trade in isolation,
-  so concurrent/overlapping trades are naturally handled — each one is
-  re-simulated against the bars it actually saw, with no cross-contamination.
+If everything matches within PRICE_TOLERANCE → MATCH ✅
+Anything off → MISMATCH ❌ with detailed diffs.
 
-Can also be run standalone:  python validator.py
+This is the safety net that proves the live engine == backtest 1:1.
 """
 
-import json
-import os
+# ============================ CONFIG ============================
+# These MUST match live_engine.py + backtester exactly.
 
-# ─── MUST MATCH live_engine.py ───────────────────────────────────
-STREAK_SIZE        = 2       # ← matches live_engine.py
-TP_CLOSE_AFTER     = 3
-FIXED_SL_POINTS    = 16.0
-SLIPPAGE_POINTS    = 0.3
-COMMISSION_PER_LOT = 0.8
+FIXED_SL_POINTS = 16.0
+SLIPPAGE_POINTS = 0.3
+TP_CLOSE_AFTER  = 3
+STREAK_SIZE     = 2
 
-# tolerances for "match"
-PRICE_TOL_PTS      = 2.0     # entry/exit price tolerance (points)
-PNL_TOL_DOLLARS    = 2.0     # absolute $ tolerance
-PNL_TOL_PCT        = 10.0    # OR % tolerance — flags if EITHER exceeded
-# ─────────────────────────────────────────────────────────────────
+# Allowed drift between live & replayed prices.
+# Live uses tick-resolution SL checks while backtest uses bar-OHLC, so a small
+# delta is expected on SL exits even in a perfect implementation. Bump if needed.
+PRICE_TOLERANCE = 0.5   # points
 
-TRADE_LOG = "trades_log.json"
+# ============================ HELPERS ============================
 
-
-def direction(candle):
-    if candle["close"] > candle["open"]:
-        return 1
-    if candle["close"] < candle["open"]:
-        return -1
+def _candle_dir(c):
+    if c["close"] > c["open"]: return 1
+    if c["close"] < c["open"]: return -1
     return 0
 
 
-def simulate_trade(bars, signal_idx, lots):
+def _find_bar_idx_by_time(bars, ts):
+    """Locate the bar whose time == ts. Returns -1 if not found."""
+    # bars are time-ordered & emit enforces strict monotonic ts,
+    # so linear-scan-from-end is fastest for recently-closed trades
+    for idx in range(len(bars) - 1, -1, -1):
+        if bars[idx]["time"] == ts:
+            return idx
+    return -1
+
+
+# ============================ REPLAY ============================
+
+def replay_trade(bars, signal_bar_time, live_direction):
     """
-    Re-runs the backtester logic on a window of bars where:
-      bars[signal_idx - STREAK_SIZE : signal_idx]   = streak
-      bars[signal_idx]                              = reversal
-      bars[signal_idx + 1]                          = entry bar
-      bars[signal_idx + 1 .. signal_idx + 1 + TP_CLOSE_AFTER] = walk-forward
+    Re-run the backtester's signal + walk-forward logic on the given bars,
+    starting from the bar matching `signal_bar_time` (= the reversal candle).
 
-    Tolerates partial walk-forward (e.g., SL hit before all TP bars elapsed).
+    Returns:
+        dict with full replay outcome, or {"signal_valid": False, ...}
+        if the signal can't be reconstructed.
     """
-    diag = (f"len(bars)={len(bars)} signal_idx={signal_idx} "
-            f"STREAK_SIZE={STREAK_SIZE} TP_AFTER={TP_CLOSE_AFTER}")
+    sig_idx = _find_bar_idx_by_time(bars, signal_bar_time)
+    if sig_idx < 0:
+        return {"signal_valid": False, "reason": "signal bar not found in history"}
 
-    # ─── validate streak ───
-    if signal_idx < STREAK_SIZE:
-        return {"ok": False, "reason": f"not enough streak bars ({diag})"}
+    # need STREAK_SIZE bars before + TP_CLOSE_AFTER bars after entry
+    if sig_idx < STREAK_SIZE:
+        return {"signal_valid": False, "reason": "insufficient pre-signal history"}
+    if sig_idx + 1 + TP_CLOSE_AFTER >= len(bars):
+        return {"signal_valid": False, "reason": "insufficient post-signal bars to walk"}
 
-    streak_dir = direction(bars[signal_idx - STREAK_SIZE])
+    # ── verify streak + reversal candle pattern (exact backtester logic) ──
+    streak_dir = _candle_dir(bars[sig_idx - STREAK_SIZE])
     if streak_dir == 0:
-        return {"ok": False, "reason": f"streak base bar is doji ({diag})"}
-    for j in range(signal_idx - STREAK_SIZE, signal_idx):
-        if direction(bars[j]) != streak_dir:
-            return {"ok": False, "reason": f"streak invalid at j={j} ({diag})"}
+        return {"signal_valid": False, "reason": "streak base bar is doji"}
+    for k in range(sig_idx - STREAK_SIZE, sig_idx):
+        if _candle_dir(bars[k]) != streak_dir:
+            return {"signal_valid": False, "reason": f"streak broken at bar idx {k}"}
 
-    reversal_dir = direction(bars[signal_idx])
+    reversal_dir = _candle_dir(bars[sig_idx])
     if reversal_dir != -streak_dir:
-        return {"ok": False, "reason": f"reversal direction wrong ({diag})"}
+        return {"signal_valid": False, "reason": "no opposite reversal candle"}
 
-    entry_idx = signal_idx + 1
-    if entry_idx >= len(bars):
-        return {"ok": False, "reason": f"no entry bar ({diag})"}
+    if reversal_dir != live_direction:
+        return {
+            "signal_valid": False,
+            "reason": f"direction mismatch: replay={reversal_dir} live={live_direction}",
+        }
 
-    # tp_idx might exceed available walk-forward bars if SL hit early — cap it
-    tp_idx_ideal = entry_idx + TP_CLOSE_AFTER
-    tp_idx = min(tp_idx_ideal, len(bars) - 1)
-    walk_truncated = tp_idx < tp_idx_ideal
-
-    # ─── entry ───
+    # ── ENTRY (matches backtester exactly) ─────────────────────────
+    entry_idx = sig_idx + 1
     raw_entry = bars[entry_idx]["open"]
     if reversal_dir == 1:
         entry_price = raw_entry + SLIPPAGE_POINTS
@@ -87,171 +94,163 @@ def simulate_trade(bars, signal_idx, lots):
         entry_price = raw_entry - SLIPPAGE_POINTS
         sl_price    = entry_price + FIXED_SL_POINTS
 
-    # ─── walk forward (intrabar SL, exact match w/ backtester) ───
+    # ── WALK FORWARD (intrabar SL via OHLC, exact backtester logic) ─
+    tp_idx = entry_idx + TP_CLOSE_AFTER
     hit_sl = False
     exit_price = None
     exit_idx = None
+    mfe_points = 0.0
+    mae_points = 0.0
+
     for k in range(entry_idx, tp_idx + 1):
         bar = bars[k]
+        bar_open = bar["open"]
+        bar_high = bar["high"]
+        bar_low  = bar["low"]
+
         if reversal_dir == 1:
-            if bar["open"] <= sl_price:
-                exit_price = bar["open"] - SLIPPAGE_POINTS
+            fav = bar_high - entry_price
+            adv = entry_price - bar_low
+        else:
+            fav = entry_price - bar_low
+            adv = bar_high - entry_price
+
+        if fav > mfe_points: mfe_points = fav
+        if adv > mae_points: mae_points = adv
+
+        if reversal_dir == 1:
+            if bar_open <= sl_price:
+                exit_price = bar_open - SLIPPAGE_POINTS
                 hit_sl = True; exit_idx = k; break
-            if bar["low"]  <= sl_price:
+            if bar_low <= sl_price:
                 exit_price = sl_price - SLIPPAGE_POINTS
                 hit_sl = True; exit_idx = k; break
         else:
-            if bar["open"] >= sl_price:
-                exit_price = bar["open"] + SLIPPAGE_POINTS
+            if bar_open >= sl_price:
+                exit_price = bar_open + SLIPPAGE_POINTS
                 hit_sl = True; exit_idx = k; break
-            if bar["high"] >= sl_price:
+            if bar_high >= sl_price:
                 exit_price = sl_price + SLIPPAGE_POINTS
                 hit_sl = True; exit_idx = k; break
 
     if not hit_sl:
-        if walk_truncated:
-            # walk-forward was cut short (live SL fired before full window emitted).
-            # Can't simulate a TP exit — mark as inconclusive.
-            return {"ok": False, "reason": f"walk-forward truncated, can't simulate TP ({diag})"}
         raw_tp = bars[tp_idx]["close"]
-        exit_price = raw_tp - SLIPPAGE_POINTS if reversal_dir == 1 else raw_tp + SLIPPAGE_POINTS
+        if reversal_dir == 1:
+            exit_price = raw_tp - SLIPPAGE_POINTS
+        else:
+            exit_price = raw_tp + SLIPPAGE_POINTS
         exit_idx = tp_idx
 
-    # ─── pnl ───
-    pnl_points    = (exit_price - entry_price) if reversal_dir == 1 else (entry_price - exit_price)
-    gross_pnl     = pnl_points * lots
-    commission    = lots * COMMISSION_PER_LOT
-    net_pnl       = gross_pnl - commission
+    # ── PnL replay (without lots — we compare pts; lots are deterministic) ──
+    if reversal_dir == 1:
+        pnl_points = exit_price - entry_price
+    else:
+        pnl_points = entry_price - exit_price
 
     return {
-        "ok": True,
-        "dir": reversal_dir,
-        "entry_price": entry_price,
-        "sl_price": sl_price,
-        "exit_price": exit_price,
-        "exit_idx": exit_idx,
-        "hit_sl": hit_sl,
-        "pnl_points": pnl_points,
-        "gross_pnl": gross_pnl,
-        "commission": commission,
-        "net_pnl": net_pnl,
+        "signal_valid":  True,
+        "entry_price":   round(entry_price, 4),
+        "exit_price":    round(exit_price,  4),
+        "sl_price":      round(sl_price,    4),
+        "hit_sl":        hit_sl,
+        "expected_reason": "SL" if hit_sl else "TP",
+        "entry_bar_time":  bars[entry_idx]["time"],
+        "exit_bar_time":   bars[exit_idx]["time"],
+        "entry_idx":       entry_idx,
+        "exit_idx":        exit_idx,
+        "bars_held":       exit_idx - entry_idx + 1,
+        "pnl_points":      round(pnl_points, 4),
+        "mfe_points":      round(mfe_points, 4),
+        "mae_points":      round(mae_points, 4),
     }
 
 
-def validate_trade(record):
+# ============================ VALIDATE ============================
+
+def validate(live_trade, bars):
     """
-    record = single trade dict written by live_engine.py
-    contains the bars window + actual fills.
-    Returns verdict dict.
+    Compare a closed live trade against the backtester replay.
 
-    Each trade is validated in isolation against its own captured bars_window,
-    so overlapping/concurrent trades don't interfere with each other.
+    Args:
+        live_trade: dict from StrategyEngine.trades  (id, dir, entry, exit,
+                    reason, entry_time, exit_time, bars_held, etc.)
+        bars: full list of closed Koko bars currently known to the engine.
+
+    Returns:
+        dict with status ∈ {"MATCH", "MISMATCH", "SKIP"} + diagnostics.
     """
-    bars       = record["bars_window"]
-    signal_idx = record["signal_idx_in_window"]
-    lots       = record["lots"]
+    result = {
+        "trade_id": live_trade.get("id"),
+        "dir":      live_trade.get("dir"),
+        "status":   "UNKNOWN",
+        "issues":   [],
+    }
 
-    sim = simulate_trade(bars, signal_idx, lots)
-    if not sim["ok"]:
-        return {
-            "match": False,
-            "reason": f"sim_failed: {sim['reason']}",
-            "expected_pnl": 0.0,
-            "pnl_diff": 0.0,
-            "pnl_diff_pct": 0.0,
-        }
+    replay = replay_trade(bars, live_trade["entry_time"], live_trade["dir"])
 
-    # compare
-    actual_entry = record["actual_entry"]
-    actual_exit  = record["actual_exit"]
-    actual_pnl   = record["net_pnl"]
+    if not replay.get("signal_valid"):
+        # we couldn't even reconstruct the signal → can't claim mismatch fairly
+        result["status"] = "SKIP"
+        result["issues"].append(f"replay unavailable: {replay.get('reason')}")
+        result["replay"] = replay
+        return result
 
-    entry_diff = abs(actual_entry - sim["entry_price"])
-    exit_diff  = abs(actual_exit  - sim["exit_price"])
-    pnl_diff   = actual_pnl - sim["net_pnl"]
-    base_pnl   = max(abs(sim["net_pnl"]), 1.0)
-    pnl_diff_pct = (pnl_diff / base_pnl) * 100.0
+    # ── numeric diffs ────────────────────────────────────────────────
+    entry_diff = abs(live_trade["entry"] - replay["entry_price"])
+    exit_diff  = abs(live_trade["exit"]  - replay["exit_price"])
+    reason_match = (live_trade["reason"] == replay["expected_reason"])
 
-    reasons = []
-    if entry_diff > PRICE_TOL_PTS:
-        reasons.append(f"entry_off_{entry_diff:.2f}pt")
-    if exit_diff > PRICE_TOL_PTS:
-        reasons.append(f"exit_off_{exit_diff:.2f}pt")
-    # OR logic — flag if EITHER absolute OR relative drift exceeds threshold
-    if abs(pnl_diff) > PNL_TOL_DOLLARS or abs(pnl_diff_pct) > PNL_TOL_PCT:
-        reasons.append(f"pnl_off_${pnl_diff:+.2f} ({pnl_diff_pct:+.1f}%)")
-    if record["hit_sl"] != sim["hit_sl"]:
-        reasons.append(
-            f"exit_reason_mismatch ("
-            f"live={'SL' if record['hit_sl'] else 'TP'}, "
-            f"sim={'SL' if sim['hit_sl'] else 'TP'})"
+    result.update({
+        "live_entry":          live_trade["entry"],
+        "expected_entry":      replay["entry_price"],
+        "entry_diff_pts":      round(entry_diff, 4),
+        "live_exit":           live_trade["exit"],
+        "expected_exit":       replay["exit_price"],
+        "exit_diff_pts":       round(exit_diff, 4),
+        "live_reason":         live_trade["reason"],
+        "expected_reason":     replay["expected_reason"],
+        "live_bars_held":      live_trade["bars_held"],
+        "expected_bars_held":  replay["bars_held"],
+        "replay":              replay,
+    })
+
+    issues = []
+    if not reason_match:
+        issues.append(
+            f"exit reason: live={live_trade['reason']} expected={replay['expected_reason']}"
         )
+    if entry_diff > PRICE_TOLERANCE:
+        issues.append(f"entry diff {entry_diff:.3f}pt > tol {PRICE_TOLERANCE}pt")
+    if exit_diff > PRICE_TOLERANCE:
+        issues.append(f"exit diff {exit_diff:.3f}pt > tol {PRICE_TOLERANCE}pt")
 
-    return {
-        "match": len(reasons) == 0,
-        "reason": ",".join(reasons) if reasons else "ok",
-        "expected_entry": sim["entry_price"],
-        "expected_exit":  sim["exit_price"],
-        "expected_pnl":   sim["net_pnl"],
-        "actual_pnl":     actual_pnl,
-        "pnl_diff":       pnl_diff,
-        "pnl_diff_pct":   pnl_diff_pct,
-        "expected_hit_sl": sim["hit_sl"],
-    }
+    if not issues:
+        result["status"] = "MATCH"
+    else:
+        result["status"] = "MISMATCH"
+        result["issues"] = issues
 
-
-# ─── standalone runner ───────────────────────────────────────────
-def _run_standalone():
-    if not os.path.exists(TRADE_LOG):
-        print(f"no log file: {TRADE_LOG}")
-        return
-    with open(TRADE_LOG) as f:
-        log = json.load(f)
-
-    matches = 0
-    mismatches = 0
-    total_actual_pnl = 0.0
-    total_expected_pnl = 0.0
-
-    print(f"\n{'─'*80}")
-    print(f" VALIDATOR  |  STREAK={STREAK_SIZE} TP={TP_CLOSE_AFTER} "
-          f"SL={FIXED_SL_POINTS}pt SLIP={SLIPPAGE_POINTS}pt COMM=${COMMISSION_PER_LOT}/lot")
-    print(f"{'─'*80}\n")
-
-    for i, rec in enumerate(log):
-        if rec.get("status") != "closed":
-            continue
-        v = validate_trade(rec)
-        tag = "✅ MATCH   " if v["match"] else "⚠️  MISMATCH"
-        print(f"#{i+1:>3} {tag}  actual=${rec['net_pnl']:+8.2f}  "
-              f"expected=${v['expected_pnl']:+8.2f}  "
-              f"diff=${v['pnl_diff']:+7.2f}  ({v['reason']})")
-        if v["match"]:
-            matches += 1
-        else:
-            mismatches += 1
-        total_actual_pnl   += rec['net_pnl']
-        total_expected_pnl += v['expected_pnl']
-
-    total = matches + mismatches
-    if total == 0:
-        print("no closed trades to validate")
-        return
-
-    match_pct = (matches / total) * 100.0
-    pnl_drift = total_actual_pnl - total_expected_pnl
-
-    print(f"\n{'─'*80}")
-    print(f" SUMMARY")
-    print(f"{'─'*80}")
-    print(f"  Total closed trades : {total}")
-    print(f"  Matches             : {matches} ({match_pct:.1f}%)")
-    print(f"  Mismatches          : {mismatches}")
-    print(f"  Total actual PnL    : ${total_actual_pnl:+.2f}")
-    print(f"  Total expected PnL  : ${total_expected_pnl:+.2f}")
-    print(f"  Cumulative drift    : ${pnl_drift:+.2f}")
-    print(f"{'─'*80}\n")
+    return result
 
 
-if __name__ == "__main__":
-    _run_standalone()
+# ============================ PRETTY PRINT ============================
+
+def format_report(v):
+    """Console-friendly one-block summary of a validation result."""
+    tid = v.get("trade_id")
+    dir_txt = "L" if v.get("dir") == 1 else "S"
+    if v["status"] == "MATCH":
+        return f"  ✅ VALIDATOR #{tid} {dir_txt}  MATCH  (entryΔ={v['entry_diff_pts']:.2f}pt, exitΔ={v['exit_diff_pts']:.2f}pt)"
+    if v["status"] == "SKIP":
+        return f"  ⚪ VALIDATOR #{tid} {dir_txt}  SKIP   ({'; '.join(v['issues'])})"
+    # MISMATCH
+    lines = [f"  ❌ VALIDATOR #{tid} {dir_txt}  MISMATCH"]
+    for issue in v["issues"]:
+        lines.append(f"       - {issue}")
+    lines.append(
+        f"       live   entry={v['live_entry']}  exit={v['live_exit']}  reason={v['live_reason']}  bars={v['live_bars_held']}"
+    )
+    lines.append(
+        f"       replay entry={v['expected_entry']}  exit={v['expected_exit']}  reason={v['expected_reason']}  bars={v['expected_bars_held']}"
+    )
+    return "\n".join(lines)

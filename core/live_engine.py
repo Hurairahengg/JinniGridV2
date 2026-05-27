@@ -1,645 +1,674 @@
+"""
+Koko Live Engine — USTEC 8pt streaming + 2-streak/3-tp strategy
+=================================================================
+- MT5 tick stream  →  Koko candles (8pt grid, 2x rev, clean ON)
+- Warmup: pulls historical ticks until 100 bars generated, THEN goes live
+- Strategy (1:1 backtest):
+    * 2 same-color bricks (streak)
+    * 1 opposite brick (reversal candle)
+    * enter immediately at market in reversal direction
+    * SL = entry ∓ 16pt (intrabar tick-level kill)
+    * exit on close of bar (entry + 3)   ← TP_CLOSE_AFTER bars after entry bar
+- LIVE_TRADING = False by default → sim mode, no MT5 orders fired
+- Flask serves chart.html on :5000 with all bars + entry/exit markers
 
-
-import os
+Run:  python live_engine.py
+"""
+import validator
 import json
 import time
-import math
-import sys
-from collections import deque
+import threading
 from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
+import telegram_bot as tg
+from flask import Flask, jsonify, send_from_directory
 
-import telegram_bot
-import validator
+# ============================ CONFIG ============================
 
-# ═════════════════════════════════════════════════════════════════
-# CONFIG
-# ═════════════════════════════════════════════════════════════════
-SYMBOL              = "USTEC"
+SYMBOL                = "USTEC"          # adjust to your broker's symbol (NAS100, USTEC.cash, etc)
+RANGE_SIZE            = 8.0
+REV_BRICKS            = 2.0
+CLEAN_MODE            = True
+PRICE_DECIMALS        = 1
+WARMUP_BARS           = 100
+WARMUP_LOOKBACK_DAYS  = 7
 
-# Bar engine
-BRICK_SIZE          = 8.0
-REV_BRICKS          = 2.0
-CLEAN_MODE          = True
-PRICE_DECIMALS      = 2
-MAX_BARS_IN_MEM     = 100
-WARMUP_BARS         = 100
+# Strategy (matches backtest)
+STREAK_SIZE           = 2
+TP_CLOSE_AFTER        = 3
+FIXED_SL_POINTS       = 16.0
+SLIPPAGE_POINTS       = 0.3
+COMMISSION_PER_LOT    = 0.8
+FLAT_RISK_DOLLARS     = 10.0
 
-# Strategy
-STREAK_SIZE         = 2
-TP_CLOSE_AFTER      = 3
-FIXED_SL_POINTS     = 16.0
+# Execution
+LIVE_TRADING          = False            # ← flip to True to actually order_send
+MAGIC_NUMBER          = 770808
+DEVIATION_POINTS      = 20
+TICK_POLL_MS          = 50
 
-# Costs (theoretical — for parity with backtester)
-SLIPPAGE_POINTS     = 0.3
-COMMISSION_PER_LOT  = 0.8
+# Web
+HTTP_PORT             = 5000
 
-# Risk — matches backtester scaling model
-RISK_PER_100        = 1.0     # $ risked per $100 of balance (1.0 = 1%)
-SCALING_ENABLED     = True    # True = check live balance each trade
-                              # False = lock to STARTING_BALANCE for all trades
-STARTING_BALANCE    = 3100.0  # used when SCALING_ENABLED = False
-POINT_VALUE_PER_LOT = 1.0     # $/pt/lot for USTEC. VERIFY YOUR BROKER.
-MIN_LOTS            = 0.01
-MAX_LOTS            = 600.0
+# =================== KOKO STREAMER (1:1 range_bars.py) ===================
 
-# MT5 order
-MAGIC_NUMBER        = 778899
-ORDER_COMMENT       = "JinniSnapback"
-DEVIATION_POINTS    = 30     # max slippage MT5 will accept on market order
-
-# Loop
-TICK_POLL_INTERVAL  = 0.05   # seconds between tick polls
-HISTORY_LOOKBACK_DAYS = 14   # how far back to scan ticks for warmup
-
-# Files
-TRADE_LOG_FILE      = "trades_log.json"
-
-
-# ═════════════════════════════════════════════════════════════════
-# LIVE KOKO BAR STREAMER  (in-memory mirror of range_bars.py)
-# ═════════════════════════════════════════════════════════════════
-class LiveKokoCandleStreamer:
+class KokoCandleStreamer:
     """
-    Same state machine as KokoCandleStreamer in range_bars.py.
-    No file I/O. Calls `on_bar_emit(bar, bar_index)` for each emitted bar.
-    Holds a rolling window of MAX_BARS_IN_MEM bars in self.bars.
+    Identical brick math to range_bars.py KokoCandleStreamer.
+    Difference: emits via callback (no file IO), and exposes get_working_bar()
+    so the live chart can render the forming brick in real time.
     """
 
-    def __init__(self, range_size, rev_bricks, clean_mode, price_decimals,
-                 max_bars=MAX_BARS_IN_MEM, on_bar_emit=None):
-        self.rs = float(range_size)
-        self.rev_bricks = float(rev_bricks)
+    def __init__(self, range_size, price_decimals, rev_bricks, clean_mode, on_bar_close):
+        self.rs         = float(range_size)
+        self.pd         = price_decimals
+        self.rev_bricks = rev_bricks
         self.clean_mode = clean_mode
-        self.pd = price_decimals
-        self.bars = deque(maxlen=max_bars)
-        self.on_bar_emit = on_bar_emit
+        self.on_bar_close = on_bar_close
 
         self.trend = 0
         self.level = None
-        self.bar = None
-        self.global_bar_count = 0   # never resets, even when deque rolls
-        self._last_written_ts = None
+        self.bar   = None
+        self.bar_count = 0
+        self._last_emitted_ts = None
 
     def _snap(self, price):
         return round(round(price / self.rs) * self.rs, self.pd)
 
-    def _emit(self, open_, high_, low_, close_, ts, volume):
-        if self._last_written_ts is not None and ts <= self._last_written_ts:
-            ts = self._last_written_ts + 1
-        self._last_written_ts = ts
-
-        bar = {
-            "time":   int(ts),
-            "open":   round(open_,  self.pd),
-            "high":   round(high_,  self.pd),
-            "low":    round(low_,   self.pd),
+    def _make_bar(self, open_, high_, low_, close_):
+        return {
+            "time":   int(self.bar["time"]),
+            "open":   round(open_, self.pd),
+            "high":   round(high_, self.pd),
+            "low":    round(low_, self.pd),
             "close":  round(close_, self.pd),
-            "volume": round(volume, 2),
+            "volume": round(self.bar["volume"], 2),
         }
-        self.bars.append(bar)
-        self.global_bar_count += 1
-        if self.on_bar_emit:
-            self.on_bar_emit(bar, self.global_bar_count - 1)
 
-    def _reset_working(self, ts):
+    def _emit(self, bar_dict):
+        ts = int(bar_dict["time"])
+        if self._last_emitted_ts is not None and ts <= self._last_emitted_ts:
+            ts = self._last_emitted_ts + 1
+        bar_dict["time"] = ts
+        self._last_emitted_ts = ts
+        self.bar_count += 1
+        self.on_bar_close(bar_dict)
+
+    def _reset_bar(self, tick):
         self.bar = {
-            "time": ts,
-            "open": self.level, "high": self.level,
-            "low":  self.level, "close": self.level,
+            "time":   tick["ts"],
+            "open":   self.level,
+            "high":   self.level,
+            "low":    self.level,
+            "close":  self.level,
             "volume": 0.0,
         }
 
-    def process_tick(self, ts, price, volume):
+    def get_working_bar(self):
+        if self.bar is None:
+            return None
+        ts = self.bar["time"]
+        if self._last_emitted_ts is not None and ts <= self._last_emitted_ts:
+            ts = self._last_emitted_ts + 1
+        return {
+            "time":   int(ts),
+            "open":   round(self.bar["open"],  self.pd),
+            "high":   round(self.bar["high"],  self.pd),
+            "low":    round(self.bar["low"],   self.pd),
+            "close":  round(self.bar["close"], self.pd),
+            "volume": round(self.bar["volume"], 2),
+        }
+
+    def process_tick(self, tick):
+        p = tick["price"]
+        v = tick["volume"]
         rs = self.rs
 
         if self.bar is None:
-            self.level = self._snap(price)
+            self.level = self._snap(p)
             self.bar = {
-                "time": ts,
-                "open": self.level, "high": self.level,
-                "low":  self.level, "close": self.level,
-                "volume": volume,
+                "time": tick["ts"], "open": self.level, "high": self.level,
+                "low": self.level, "close": self.level, "volume": v,
             }
             return
 
-        self.bar["volume"] += volume
-        if price > self.bar["high"]: self.bar["high"] = price
-        if price < self.bar["low"]:  self.bar["low"]  = price
+        self.bar["volume"] += v
+        self.bar["close"]   = p
+        self.bar["high"]    = max(self.bar["high"], p)
+        self.bar["low"]     = min(self.bar["low"],  p)
 
         while True:
             lvl = self.level
 
+            # ── STARTUP ──────────────────────────────────────
             if self.trend == 0:
                 up_t   = round(lvl + rs, self.pd)
                 down_t = round(lvl - rs, self.pd)
-                if price >= up_t:
-                    bh = max(self.bar["high"], up_t)
-                    self._emit(lvl, bh, self.bar["low"], up_t, self.bar["time"], self.bar["volume"])
-                    self.trend = 1; self.level = up_t; self._reset_working(ts); continue
-                elif price <= down_t:
-                    bl = min(self.bar["low"], down_t)
-                    self._emit(lvl, self.bar["high"], bl, down_t, self.bar["time"], self.bar["volume"])
-                    self.trend = -1; self.level = down_t; self._reset_working(ts); continue
+                if p >= up_t:
+                    self._emit(self._make_bar(lvl, max(self.bar["high"], up_t), self.bar["low"], up_t))
+                    self.trend = 1; self.level = up_t; self._reset_bar(tick); continue
+                elif p <= down_t:
+                    self._emit(self._make_bar(lvl, self.bar["high"], min(self.bar["low"], down_t), down_t))
+                    self.trend = -1; self.level = down_t; self._reset_bar(tick); continue
                 else:
                     break
 
+            # ── BULL ─────────────────────────────────────────
             elif self.trend == 1:
-                cont = round(lvl + rs, self.pd)
-                rev  = round(lvl - self.rev_bricks * rs, self.pd)
-                if price >= cont:
-                    bh = max(self.bar["high"], cont)
-                    self._emit(lvl, bh, self.bar["low"], cont, self.bar["time"], self.bar["volume"])
-                    self.level = cont; self._reset_working(ts); continue
-                elif price <= rev:
+                cont_t = round(lvl + rs, self.pd)
+                rev_t  = round(lvl - self.rev_bricks * rs, self.pd)
+                if p >= cont_t:
+                    self._emit(self._make_bar(lvl, max(self.bar["high"], cont_t), self.bar["low"], cont_t))
+                    self.level = cont_t; self._reset_bar(tick); continue
+                elif p <= rev_t:
                     if self.clean_mode:
-                        bc = rev
-                        bo = round(rev + rs, self.pd)
-                        bh = max(self.bar["high"], lvl)
-                        bl = min(self.bar["low"], bc)
+                        b_close = rev_t
+                        b_open  = round(rev_t + rs, self.pd)
+                        b_high  = max(self.bar["high"], lvl)
+                        b_low   = min(self.bar["low"],  b_close)
                     else:
-                        bo = lvl; bc = rev
-                        bh = self.bar["high"]
-                        bl = min(self.bar["low"], bc)
-                    self._emit(bo, bh, bl, bc, self.bar["time"], self.bar["volume"])
-                    self.trend = -1; self.level = rev; self._reset_working(ts); continue
+                        b_open  = lvl
+                        b_close = rev_t
+                        b_high  = self.bar["high"]
+                        b_low   = min(self.bar["low"], b_close)
+                    self._emit(self._make_bar(b_open, b_high, b_low, b_close))
+                    self.trend = -1; self.level = rev_t; self._reset_bar(tick); continue
                 else:
                     break
 
-            else:   # trend == -1
-                cont = round(lvl - rs, self.pd)
-                rev  = round(lvl + self.rev_bricks * rs, self.pd)
-                if price <= cont:
-                    bl = min(self.bar["low"], cont)
-                    self._emit(lvl, self.bar["high"], bl, cont, self.bar["time"], self.bar["volume"])
-                    self.level = cont; self._reset_working(ts); continue
-                elif price >= rev:
+            # ── BEAR ─────────────────────────────────────────
+            elif self.trend == -1:
+                cont_t = round(lvl - rs, self.pd)
+                rev_t  = round(lvl + self.rev_bricks * rs, self.pd)
+                if p <= cont_t:
+                    self._emit(self._make_bar(lvl, self.bar["high"], min(self.bar["low"], cont_t), cont_t))
+                    self.level = cont_t; self._reset_bar(tick); continue
+                elif p >= rev_t:
                     if self.clean_mode:
-                        bc = rev
-                        bo = round(rev - rs, self.pd)
-                        bh = max(self.bar["high"], bc)
-                        bl = min(self.bar["low"], lvl)
+                        b_close = rev_t
+                        b_open  = round(rev_t - rs, self.pd)
+                        b_high  = max(self.bar["high"], b_close)
+                        b_low   = min(self.bar["low"],  lvl)
                     else:
-                        bo = lvl; bc = rev
-                        bh = max(self.bar["high"], bc)
-                        bl = self.bar["low"]
-                    self._emit(bo, bh, bl, bc, self.bar["time"], self.bar["volume"])
-                    self.trend = 1; self.level = rev; self._reset_working(ts); continue
+                        b_open  = lvl
+                        b_close = rev_t
+                        b_high  = max(self.bar["high"], b_close)
+                        b_low   = self.bar["low"]
+                    self._emit(self._make_bar(b_open, b_high, b_low, b_close))
+                    self.trend = 1; self.level = rev_t; self._reset_bar(tick); continue
                 else:
                     break
 
 
-# ═════════════════════════════════════════════════════════════════
-# TRADE LOG (json file, append on close)
-# ═════════════════════════════════════════════════════════════════
-def load_log():
-    if not os.path.exists(TRADE_LOG_FILE):
-        return []
-    try:
-        with open(TRADE_LOG_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return []
+# ============================ STRATEGY ============================
 
-def save_log(log):
-    with open(TRADE_LOG_FILE, "w") as f:
-        json.dump(log, f, indent=2, default=str)
-
-
-# ═════════════════════════════════════════════════════════════════
-# STRATEGY ENGINE — concurrent / overlapping trades, 1:1 with backtester
-# ═════════════════════════════════════════════════════════════════
-def direction(c):
+def candle_dir(c):
     if c["close"] > c["open"]: return 1
     if c["close"] < c["open"]: return -1
     return 0
 
 
-def get_current_risk():
-    """
-    Mirrors backtester:
-      scaling ON  → risk = (live_balance / 100) * RISK_PER_100
-      scaling OFF → risk = (STARTING_BALANCE / 100) * RISK_PER_100  (fixed)
-    """
-    if SCALING_ENABLED:
-        acct = mt5.account_info()
-        if acct is None:
-            telegram_bot.send_error("account_info() returned None, using STARTING_BALANCE")
-            balance = STARTING_BALANCE
-        else:
-            balance = acct.balance
-    else:
-        balance = STARTING_BALANCE
-    return (balance / 100.0) * RISK_PER_100, balance
-
-
 class StrategyEngine:
     """
-    NEW: concurrent positions allowed. Signals fire on EVERY bar regardless of
-    whether other positions are open. This mirrors backtester's `i += 1`
-    behavior where overlapping trades are counted as separate trades.
-
-    Each open trade in self.open_trades is an independent dict with its own
-    ticket, bars_since_entry counter, bars_window, etc.
+    1:1 backtest logic with OVERLAPPING positions.
+    - last STREAK_SIZE bars same color, last bar opposite → signal fires every time
+    - each position lives independently: own entry, own SL, own bars_held counter
+    - SL checked per-tick on every open position
+    - TP: exit on close of the bar where bars_held == TP_CLOSE_AFTER + 1
     """
 
-    def __init__(self, streamer):
-        self.streamer = streamer
-        self.open_trades = []          # list of open trade dicts
-        self.live_bars_seen = 0        # post-warmup bars only — signals gated on this
+    def __init__(self):
+        self.positions     = []
+        self.trades        = []
+        self.validations   = []   # list of validator results, one per closed trade
+        self.markers       = []
+        self.warmup_done   = False
+        self.equity        = 0.0
+        self._trade_id_seq = 0
+        self._validate_fn  = None   # injected by LiveEngine so we can pass bars
 
-    # ─── called by streamer for EVERY new bar (live + warmup) ───
-    def on_bar(self, bar, global_idx, is_warmup):
-        if is_warmup:
-            return   # don't trade during warmup, only build history
+    def _next_trade_id(self):
+        self._trade_id_seq += 1
+        return self._trade_id_seq
 
-        self.live_bars_seen += 1
+    def _calc_lots(self):
+        raw = FLAT_RISK_DOLLARS / FIXED_SL_POINTS
+        return max(0.01, min(600.0, round(raw, 2)))
 
-        # ── 1) increment all open trades' bar counters & check for TP exits ──
-        # iterate over a copy because _close_trade_tp will mutate self.open_trades
-        for trade in list(self.open_trades):
-            trade["bars_since_entry"] += 1
-            trade["bars_window"].append(bar)
-            if trade["bars_since_entry"] >= TP_CLOSE_AFTER + 1:
-                self._close_trade_tp(trade, bar)
-
-        # ── 2) always scan for new signal (overlap allowed, matches backtester) ──
-        required_live_bars = STREAK_SIZE + 1   # streak + reversal bar
-        if self.live_bars_seen < required_live_bars:
-            print(f"[live] bar #{self.live_bars_seen}/{required_live_bars} — building live history, no signals yet")
-            return
-
-        self._check_signal()
-
-    def _check_signal(self):
-        bars = list(self.streamer.bars)
+    def _check_signal(self, bars):
         if len(bars) < STREAK_SIZE + 1:
-            return
+            return 0
+        recent = bars[-(STREAK_SIZE + 1):]
+        dirs   = [candle_dir(b) for b in recent]
+        streak_dir = dirs[0]
+        if streak_dir == 0:
+            return 0
+        for d in dirs[:STREAK_SIZE]:
+            if d != streak_dir:
+                return 0
+        rev_dir = dirs[STREAK_SIZE]
+        if rev_dir != -streak_dir:
+            return 0
+        return rev_dir
 
-        signal_bar     = bars[-1]
-        reversal_dir   = direction(signal_bar)
-        if reversal_dir == 0:
-            return
+    # ── OPEN ─────────────────────────────────────────────────────
 
-        # streak: bars[-1-STREAK_SIZE .. -2] all same direction = -reversal_dir
-        streak_dir = -reversal_dir
-        streak_slice = bars[-(STREAK_SIZE + 1):-1]
-        for b in streak_slice:
-            if direction(b) != streak_dir:
-                return
-
-        # ─── SIGNAL VALID — fire order (concurrent allowed) ───
-        self._open_trade(reversal_dir, bars, streak_slice, signal_bar)
-
-    # ─── ORDER EXECUTION ────────────────────────────────────────
-    def _open_trade(self, reversal_dir, bars_snapshot, streak_slice, signal_bar):
-        # theoretical entry = next bar's open = current grid level
-        theo_entry = self.streamer.level
-        if reversal_dir == 1:
-            theo_entry_priced = theo_entry + SLIPPAGE_POINTS
-            theo_sl           = theo_entry_priced - FIXED_SL_POINTS
+    def _open_position(self, direction, signal_bar):
+        theoretical_entry = signal_bar["close"]
+        if direction == 1:
+            entry_price = theoretical_entry + SLIPPAGE_POINTS
+            sl_price    = entry_price - FIXED_SL_POINTS
         else:
-            theo_entry_priced = theo_entry - SLIPPAGE_POINTS
-            theo_sl           = theo_entry_priced + FIXED_SL_POINTS
+            entry_price = theoretical_entry - SLIPPAGE_POINTS
+            sl_price    = entry_price + FIXED_SL_POINTS
 
-        # ─── dynamic risk + lot sizing (mirror backtester) ───
-        risk, balance_used = get_current_risk()
-        if risk <= 0:
-            telegram_bot.send_error(f"non-positive risk (balance=${balance_used:.2f}), skipping trade")
-            return
-        raw_lots = risk / (FIXED_SL_POINTS * POINT_VALUE_PER_LOT)
-        lots = max(MIN_LOTS, min(MAX_LOTS, raw_lots))
-        # round to broker's volume step
-        info = mt5.symbol_info(SYMBOL)
-        if info is None:
-            telegram_bot.send_error(f"symbol_info({SYMBOL}) returned None")
-            return
-        step = info.volume_step or 0.01
-        lots = math.floor(lots / step) * step
-        lots = max(info.volume_min, min(info.volume_max, lots))
-        lots = round(lots, 2)
+        lots = self._calc_lots()
+        tid  = self._next_trade_id()
 
-        # ─── place MT5 market order with attached SL ───
-        order_type = mt5.ORDER_TYPE_BUY if reversal_dir == 1 else mt5.ORDER_TYPE_SELL
-        tick = mt5.symbol_info_tick(SYMBOL)
-        price = tick.ask if reversal_dir == 1 else tick.bid
-
-        if reversal_dir == 1:
-            live_sl = round(price - FIXED_SL_POINTS, PRICE_DECIMALS)
-        else:
-            live_sl = round(price + FIXED_SL_POINTS, PRICE_DECIMALS)
-
-        request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       SYMBOL,
-            "volume":       lots,
-            "type":         order_type,
-            "price":        price,
-            "sl":           live_sl,
-            "deviation":    DEVIATION_POINTS,
-            "magic":        MAGIC_NUMBER,
-            "comment":      ORDER_COMMENT,
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+        pos = {
+            "id":            tid,
+            "dir":           direction,
+            "entry_price":   round(entry_price, PRICE_DECIMALS),
+            "sl_price":      round(sl_price,    PRICE_DECIMALS),
+            "lots":          lots,
+            "entry_time":    signal_bar["time"],
+            "bars_held":     1,    # signal bar = entry bar = bar 1
+            "mfe_points":    0.0,
+            "mae_points":    0.0,
+            "broker_ticket": None,
         }
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            err = result.comment if result else mt5.last_error()
-            telegram_bot.send_error(f"order_send failed: {err}")
-            return
+        self.positions.append(pos)
 
-        actual_entry = result.price
-        ticket = result.order
-
-        bars_window = list(streak_slice) + [signal_bar]
-        signal_idx_in_window = len(bars_window) - 1
-
-        trade = {
-            "status":            "open",
-            "symbol":            SYMBOL,
-            "ticket":            ticket,
-            "dir":               reversal_dir,
-            "lots":              lots,
-            "risk_used":         risk,
-            "balance_at_entry":  balance_used,
-            "scaling_enabled":   SCALING_ENABLED,
-            "entry_time":        datetime.now(timezone.utc).isoformat(),
-            "theoretical_entry": theo_entry_priced,
-            "actual_entry":      actual_entry,
-            "theoretical_sl":    theo_sl,
-            "actual_sl":         live_sl,
-            "sl_price":          live_sl,
-            "sl_pts":             FIXED_SL_POINTS,
-            "streak_summary":    " ".join(f"{'+' if direction(b)==1 else '-'}" for b in streak_slice),
-            "reversal_summary":  f"{'+' if reversal_dir==1 else '-'} O={signal_bar['open']} C={signal_bar['close']}",
-            "bars_window":            bars_window,
-            "signal_idx_in_window":   signal_idx_in_window,
-            "entry_global_idx":       self.streamer.global_bar_count,
-            # per-trade counter (replaces old single-trade state machine)
-            "bars_since_entry":       0,
-        }
-
-        self.open_trades.append(trade)
-
-        telegram_bot.send_signal(trade)
-        print(f"[trade] OPEN  ticket={ticket} dir={reversal_dir} entry={actual_entry} "
-              f"sl={live_sl} lots={lots} | concurrent_open={len(self.open_trades)}")
-
-    def _close_trade_tp(self, trade, exit_bar):
-        """Send market close at the moment the TP bar emits for the given trade."""
-        ticket = trade["ticket"]
-        positions = mt5.positions_get(ticket=ticket)
-        if not positions:
-            # position already closed (SL hit before we got here) — handle via reconcile
-            self._reconcile_closed_position(trade, exit_bar)
-            return
-
-        pos = positions[0]
-        tick = mt5.symbol_info_tick(SYMBOL)
-        is_long = (pos.type == mt5.POSITION_TYPE_BUY)
-        close_type  = mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY
-        close_price = tick.bid if is_long else tick.ask
-
-        request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       SYMBOL,
-            "volume":       pos.volume,
-            "type":         close_type,
-            "position":     ticket,
-            "price":        close_price,
-            "deviation":    DEVIATION_POINTS,
-            "magic":        MAGIC_NUMBER,
-            "comment":      "tp_close",
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            err = result.comment if result else mt5.last_error()
-            telegram_bot.send_error(f"TP close failed for ticket {ticket}: {err}")
-            return
-
-        self._finalize_trade(trade, exit_bar, result.price, hit_sl=False)
-
-    def _reconcile_closed_position(self, trade, exit_bar):
-        """If MT5 already closed the position (SL trigger), pull deal info and finalize."""
-        ticket = trade["ticket"]
-        from_time = datetime.now(timezone.utc) - timedelta(hours=24)
-        deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc), position=ticket)
-        if not deals:
-            telegram_bot.send_error(f"could not find closing deal for ticket {ticket}")
-            # remove from open list anyway to prevent loop spam
-            if trade in self.open_trades:
-                self.open_trades.remove(trade)
-            return
-        close_deal = max(deals, key=lambda d: d.time)
-        self._finalize_trade(trade, exit_bar, close_deal.price, hit_sl=True)
-
-    def _finalize_trade(self, trade, exit_bar, actual_exit, hit_sl):
-        actual_entry = trade["actual_entry"]
-        is_long = trade["dir"] == 1
-        pnl_points = (actual_exit - actual_entry) if is_long else (actual_entry - actual_exit)
-        gross_pnl  = pnl_points * trade["lots"] * POINT_VALUE_PER_LOT
-        commission = trade["lots"] * COMMISSION_PER_LOT
-        net_pnl    = gross_pnl - commission
-
-        # sanity check bars_window length
-        expected_total = (STREAK_SIZE + 1) + trade["bars_since_entry"]
-        actual_total   = len(trade["bars_window"])
-        if actual_total != expected_total:
-            print(f"[validator] ⚠️ bars_window size mismatch ticket={trade['ticket']}: "
-                  f"expected={expected_total} actual={actual_total} "
-                  f"bars_since_entry={trade['bars_since_entry']}")
-
-        trade.update({
-            "status":      "closed",
-            "exit_time":   datetime.now(timezone.utc).isoformat(),
-            "actual_exit": actual_exit,
-            "hit_sl":      hit_sl,
-            "pnl_points":  pnl_points,
-            "gross_pnl":   gross_pnl,
-            "commission":  commission,
-            "net_pnl":     net_pnl,
-            "bars_held":   trade["bars_since_entry"],
-            "r_multiple":  net_pnl / trade["risk_used"] if trade["risk_used"] > 0 else 0.0,
+        self.markers.append({
+            "time":     signal_bar["time"],
+            "position": "belowBar" if direction == 1 else "aboveBar",
+            "color":    "#4caf50" if direction == 1 else "#ef5350",
+            "shape":    "arrowUp" if direction == 1 else "arrowDown",
+            "text":     f"#{tid} {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.1f}",
         })
 
-        # validate
-        verdict = validator.validate_trade(trade)
-        trade["validator_verdict"] = verdict
+        if LIVE_TRADING:
+            self._send_mt5_order(pos)
 
-        # log
-        log = load_log()
-        log.append(trade)
-        save_log(log)
+        print(f"[ENTRY #{tid}] {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.1f}  SL={sl_price:.1f}  lots={lots}  (open={len(self.positions)})")
 
-        # notify
-        telegram_bot.send_close(trade, verdict)
-        match_tag = "MATCH" if verdict["match"] else "MISMATCH"
-        print(f"[trade] CLOSE ticket={trade['ticket']} pnl=${net_pnl:+.2f} "
-              f"reason={'SL' if hit_sl else 'TP'} validator={match_tag} | "
-              f"remaining_open={len(self.open_trades) - 1}")
+        tg.notify_entry(
+            trade_id=tid,
+            direction=direction,
+            entry=entry_price,
+            sl=sl_price,
+            lots=lots,
+            bar_time=signal_bar["time"],
+            position_count=len(self.positions),
+        )
 
-        # remove from open list
-        if trade in self.open_trades:
-            self.open_trades.remove(trade)
+    # ── CLOSE ────────────────────────────────────────────────────
 
-    # ─── poll MT5 each loop to detect broker-side SL closure on ANY open trade ────
-    def poll_position_status(self):
-        if not self.open_trades:
+    def _close_position(self, pos, exit_price, reason, exit_time):
+        if pos["dir"] == 1:
+            pnl_points = exit_price - pos["entry_price"]
+        else:
+            pnl_points = pos["entry_price"] - exit_price
+
+        gross      = pnl_points * pos["lots"]
+        commission = pos["lots"] * COMMISSION_PER_LOT
+        net        = gross - commission
+
+        self.equity += net
+
+        trade = {
+            "id":         pos["id"],
+            "dir":        pos["dir"],
+            "entry":      pos["entry_price"],
+            "exit":       round(exit_price, PRICE_DECIMALS),
+            "sl":         pos["sl_price"],
+            "lots":       pos["lots"],
+            "pnl_points": round(pnl_points, 2),
+            "net_pnl":    round(net, 2),
+            "reason":     reason,
+            "entry_time": pos["entry_time"],
+            "exit_time":  exit_time,
+            "bars_held":  pos["bars_held"],
+            "mfe_points": round(pos["mfe_points"], 2),
+            "mae_points": round(pos["mae_points"], 2),
+        }
+        self.trades.append(trade)
+
+        self.markers.append({
+            "time":     exit_time,
+            "position": "aboveBar" if pos["dir"] == 1 else "belowBar",
+            "color":    "#26c6da" if reason == "TP" else "#ff9800",
+            "shape":    "circle",
+            "text":     f"#{pos['id']} {reason} {net:+.2f}",
+        })
+
+        if LIVE_TRADING and pos["broker_ticket"] is not None:
+            self._close_mt5_order(pos)
+
+        if pos in self.positions:
+            self.positions.remove(pos)
+
+        print(f"[EXIT/{reason} #{pos['id']}] @ {exit_price:.1f}  pnl={net:+.2f}$  bars_held={pos['bars_held']}  equity=${self.equity:.2f}  (open={len(self.positions)})")
+
+        tg.notify_exit(
+            trade_id=pos["id"],
+            direction=pos["dir"],
+            entry=pos["entry_price"],
+            exit_px=exit_price,
+            net_pnl=net,
+            reason=reason,
+            bars_held=pos["bars_held"],
+            equity=self.equity,
+            position_count=len(self.positions),
+        )
+        # ── run the validator on this closed trade ────────────
+        if self._validate_fn is not None:
+            try:
+                v_result = self._validate_fn(trade)
+                self.validations.append(v_result)
+                print(validator.format_report(v_result))
+                tg.notify_validation(v_result)
+            except Exception as e:
+                print(f"[VALIDATOR-ERR] {e}")
+
+    # ── TICK HOOK (per-position SL check) ────────────────────────
+
+    def on_tick(self, tick):
+        if not self.positions:
             return
-        for trade in list(self.open_trades):
-            ticket = trade["ticket"]
-            positions = mt5.positions_get(ticket=ticket)
-            if not positions:
-                # position closed by SL (or manual). reconcile.
-                last_bar = self.streamer.bars[-1] if self.streamer.bars else None
-                self._reconcile_closed_position(trade, last_bar)
+        price = tick["price"]
+        # iterate over copy so we can close mid-loop
+        for pos in list(self.positions):
+            # MFE/MAE
+            if pos["dir"] == 1:
+                fav = price - pos["entry_price"]
+                adv = pos["entry_price"] - price
+            else:
+                fav = pos["entry_price"] - price
+                adv = price - pos["entry_price"]
+            if fav > pos["mfe_points"]: pos["mfe_points"] = fav
+            if adv > pos["mae_points"]: pos["mae_points"] = adv
+
+            # SL
+            if pos["dir"] == 1 and price <= pos["sl_price"]:
+                exit_price = pos["sl_price"] - SLIPPAGE_POINTS
+                self._close_position(pos, exit_price, "SL", tick["ts"])
+            elif pos["dir"] == -1 and price >= pos["sl_price"]:
+                exit_price = pos["sl_price"] + SLIPPAGE_POINTS
+                self._close_position(pos, exit_price, "SL", tick["ts"])
+
+    # ── BAR CLOSE HOOK ───────────────────────────────────────────
+
+    def on_bar_close(self, bar, all_bars):
+        # 1) age existing positions and exit any that reach TP horizon
+        for pos in list(self.positions):
+            pos["bars_held"] += 1
+            if pos["bars_held"] >= TP_CLOSE_AFTER + 1:
+                if pos["dir"] == 1:
+                    exit_price = bar["close"] - SLIPPAGE_POINTS
+                else:
+                    exit_price = bar["close"] + SLIPPAGE_POINTS
+                self._close_position(pos, exit_price, "TP", bar["time"])
+
+        # 2) signal scan — ALWAYS, regardless of open positions (overlap)
+        if not self.warmup_done:
+            return
+        if len(all_bars) < STREAK_SIZE + 1:
+            return
+
+        sig = self._check_signal(all_bars)
+        if sig == 0:
+            return
+
+        self._open_position(sig, bar)
+
+    # ── MT5 EXECUTION ────────────────────────────────────────────
+
+    def _send_mt5_order(self, pos):
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            print("[MT5] no tick, order aborted")
+            return
+        price = tick.ask if pos["dir"] == 1 else tick.bid
+        order_type = mt5.ORDER_TYPE_BUY if pos["dir"] == 1 else mt5.ORDER_TYPE_SELL
+
+        req = {
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       SYMBOL,
+            "volume":       pos["lots"],
+            "type":         order_type,
+            "price":        price,
+            "sl":           pos["sl_price"],
+            "deviation":    DEVIATION_POINTS,
+            "magic":        MAGIC_NUMBER,
+            "comment":      f"koko_#{pos['id']}",
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(req)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"[MT5] order failed: {result}")
+            return
+        pos["broker_ticket"] = result.order
+        print(f"[MT5] #{pos['id']} filled ticket={result.order}")
+
+    def _close_mt5_order(self, pos):
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            return
+        close_type = mt5.ORDER_TYPE_SELL if pos["dir"] == 1 else mt5.ORDER_TYPE_BUY
+        price = tick.bid if pos["dir"] == 1 else tick.ask
+        req = {
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       SYMBOL,
+            "volume":       pos["lots"],
+            "type":         close_type,
+            "position":     pos["broker_ticket"],
+            "price":        price,
+            "deviation":    DEVIATION_POINTS,
+            "magic":        MAGIC_NUMBER,
+            "comment":      f"koko_close_#{pos['id']}",
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(req)
+        print(f"[MT5] close #{pos['id']} result: {result}")
 
 
-# ═════════════════════════════════════════════════════════════════
-# WARMUP — pull historical ticks, build first 100 bars
-# ═════════════════════════════════════════════════════════════════
-def warmup(streamer):
-    print(f"[warmup] fetching historical ticks for {SYMBOL}…")
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=HISTORY_LOOKBACK_DAYS)
+# ============================ ENGINE ============================
 
-    ticks = mt5.copy_ticks_range(SYMBOL, start, end, mt5.COPY_TICKS_ALL)
-    if ticks is None or len(ticks) == 0:
-        telegram_bot.send_error(f"warmup: no ticks from copy_ticks_range")
-        return False
+class LiveEngine:
+    def __init__(self):
+        self.bars     = []
+        self.strategy = StrategyEngine()
+        self.strategy._validate_fn = lambda trade: validator.validate(trade, self.bars)
+        self.streamer = KokoCandleStreamer(
+            range_size=RANGE_SIZE,
+            price_decimals=PRICE_DECIMALS,
+            rev_bricks=REV_BRICKS,
+            clean_mode=CLEAN_MODE,
+            on_bar_close=self._on_bar_close,
+        )
+        self.last_tick_time = 0
+        self.last_price     = None
+        self.lock           = threading.Lock()
+        self.running        = True
 
-    print(f"[warmup] got {len(ticks):,} ticks, building bars…")
-    last_ts = None
-    for t in ticks:
-        ts = int(t["time"])
-        bid = float(t["bid"]); ask = float(t["ask"]); last = float(t["last"])
-        if bid > 0 and ask > 0: price = (bid + ask) / 2.0
-        elif last > 0:          price = last
-        elif bid > 0:           price = bid
-        elif ask > 0:           price = ask
-        else: continue
-        vol = float(t["volume"])
-        if last_ts is not None and ts < last_ts: ts = last_ts
-        last_ts = ts
-        streamer.process_tick(ts, price, vol)
+    def _on_bar_close(self, bar):
+        with self.lock:
+            self.bars.append(bar)
+            self.strategy.on_bar_close(bar, self.bars)
+            if not self.strategy.warmup_done and len(self.bars) >= WARMUP_BARS:
+                self.strategy.warmup_done = True
+                print(f"\n{'='*60}\n  WARMUP COMPLETE — {len(self.bars)} bars built\n  STRATEGY IS NOW LIVE\n{'='*60}\n")
+                tg.notify_warmup_done(len(self.bars), self.last_price)
 
-        if streamer.global_bar_count >= WARMUP_BARS:
-            if len(streamer.bars) >= MAX_BARS_IN_MEM:
+    # ── MT5 INIT ─────────────────────────────────────────────────
+
+    def init_mt5(self):
+        if not mt5.initialize():
+            raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+        info = mt5.symbol_info(SYMBOL)
+        if info is None:
+            raise RuntimeError(f"Symbol {SYMBOL} not found")
+        if not info.visible:
+            mt5.symbol_select(SYMBOL, True)
+        print(f"[MT5] connected. symbol={SYMBOL} digits={info.digits} point={info.point}")
+
+    # ── WARMUP ───────────────────────────────────────────────────
+
+    def warmup(self):
+        print(f"[WARMUP] fetching last {WARMUP_LOOKBACK_DAYS}d of ticks...")
+        end   = datetime.now(timezone.utc)
+        start = end - timedelta(days=WARMUP_LOOKBACK_DAYS)
+
+        ticks = mt5.copy_ticks_range(SYMBOL, start, end, mt5.COPY_TICKS_ALL)
+        if ticks is None or len(ticks) == 0:
+            raise RuntimeError("no warmup ticks returned")
+
+        print(f"[WARMUP] {len(ticks):,} ticks pulled, streaming through bar builder...")
+
+        for t in ticks:
+            bid = float(t["bid"])
+            ask = float(t["ask"])
+            if bid > 0 and ask > 0:
+                price = (bid + ask) / 2.0
+            elif "last" in t.dtype.names and float(t["last"]) > 0:
+                price = float(t["last"])
+            elif bid > 0:
+                price = bid
+            elif ask > 0:
+                price = ask
+            else:
+                continue
+
+            vol = float(t["volume"]) if "volume" in t.dtype.names else 0.0
+            ts  = int(t["time"])
+
+            self.streamer.process_tick({"ts": ts, "price": price, "volume": vol})
+            self.last_tick_time = ts
+            self.last_price = price
+
+            if len(self.bars) >= WARMUP_BARS and self.strategy.warmup_done:
                 break
 
-    print(f"[warmup] built {streamer.global_bar_count} bars total, "
-          f"{len(streamer.bars)} in memory")
-    return True
+        if not self.strategy.warmup_done:
+            print(f"[WARMUP] only {len(self.bars)} bars built from {WARMUP_LOOKBACK_DAYS}d — extend lookback or wait for live")
+        else:
+            print(f"[WARMUP] done. {len(self.bars)} bars, last price={self.last_price}")
+
+    # ── LIVE LOOP ────────────────────────────────────────────────
+
+    def live_loop(self):
+        print("[LIVE] tick poll started")
+        while self.running:
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick is None:
+                time.sleep(TICK_POLL_MS / 1000.0)
+                continue
+
+            ts = int(tick.time)
+            bid, ask = float(tick.bid), float(tick.ask)
+            if bid > 0 and ask > 0:
+                price = (bid + ask) / 2.0
+            elif bid > 0:
+                price = bid
+            elif ask > 0:
+                price = ask
+            else:
+                time.sleep(TICK_POLL_MS / 1000.0)
+                continue
+            vol = float(tick.volume) if hasattr(tick, "volume") else 0.0
+
+            # dedupe: only feed if time advanced OR price changed
+            if ts < self.last_tick_time:
+                ts = self.last_tick_time
+            if ts == self.last_tick_time and price == self.last_price:
+                time.sleep(TICK_POLL_MS / 1000.0)
+                continue
+
+            t_obj = {"ts": ts, "price": price, "volume": vol}
+            with self.lock:
+                self.strategy.on_tick(t_obj)           # SL check at tick resolution
+                self.streamer.process_tick(t_obj)      # may fire on_bar_close
+
+            self.last_tick_time = ts
+            self.last_price     = price
+
+            time.sleep(TICK_POLL_MS / 1000.0)
+
+    def snapshot(self):
+        with self.lock:
+            working = self.streamer.get_working_bar()
+            return {
+                "bars":         list(self.bars),
+                "working_bar":  working,
+                "markers":      list(self.strategy.markers),
+                "trades":       list(self.strategy.trades),
+                "positions":    [dict(p) for p in self.strategy.positions],
+                "warmup_done":  self.strategy.warmup_done,
+                "validations":  list(self.strategy.validations),
+                "bar_count":    len(self.bars),
+                "equity":       round(self.strategy.equity, 2),
+                "last_price":   self.last_price,
+                "symbol":       SYMBOL,
+                "live_trading": LIVE_TRADING,
+                "config": {
+                    "range":   RANGE_SIZE,
+                    "rev":     REV_BRICKS,
+                    "clean":   CLEAN_MODE,
+                    "streak":  STREAK_SIZE,
+                    "tp":      TP_CLOSE_AFTER,
+                    "sl":      FIXED_SL_POINTS,
+                    "risk":    FLAT_RISK_DOLLARS,
+                },
+            }
 
 
-# ═════════════════════════════════════════════════════════════════
-# MAIN LOOP
-# ═════════════════════════════════════════════════════════════════
+# ============================ FLASK ============================
+
+engine = LiveEngine()
+app = Flask(__name__, static_folder=".", static_url_path="")
+
+@app.route("/")
+def index():
+    return send_from_directory(".", "chart.html")
+
+@app.route("/api/state")
+def state():
+    return jsonify(engine.snapshot())
+
+
+# ============================ MAIN ============================
+
 def main():
-    if not mt5.initialize():
-        print(f"mt5.initialize() failed: {mt5.last_error()}")
-        sys.exit(1)
+    print("="*60)
+    print(f"  KOKO LIVE ENGINE — {SYMBOL} {RANGE_SIZE}pt  |  LIVE_TRADING={LIVE_TRADING}")
+    print("="*60)
 
-    if not mt5.symbol_select(SYMBOL, True):
-        telegram_bot.send_error(f"symbol_select({SYMBOL}) failed")
-        sys.exit(1)
-
-    info = mt5.symbol_info(SYMBOL)
-    if info is None:
-        telegram_bot.send_error(f"symbol_info({SYMBOL}) None")
-        sys.exit(1)
-
-    telegram_bot.send_boot({
-        "boot_time":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "symbol":           SYMBOL,
-        "brick":            BRICK_SIZE,
-        "rev":              REV_BRICKS,
-        "max_bars":         MAX_BARS_IN_MEM,
-        "streak":           STREAK_SIZE,
-        "tp":               TP_CLOSE_AFTER,
-        "sl":               FIXED_SL_POINTS,
-        "scaling_enabled":  SCALING_ENABLED,
-        "starting_balance": STARTING_BALANCE,
-        "rp100":            RISK_PER_100,
-        "pt_value":         POINT_VALUE_PER_LOT,
-        "commission":       COMMISSION_PER_LOT,
-        "slippage":         SLIPPAGE_POINTS,
-    })
-
-    is_warmup = [True]
-
-    streamer = LiveKokoCandleStreamer(
-        range_size=BRICK_SIZE,
-        rev_bricks=REV_BRICKS,
-        clean_mode=CLEAN_MODE,
-        price_decimals=PRICE_DECIMALS,
-        max_bars=MAX_BARS_IN_MEM,
+    engine.init_mt5()
+    tg.notify_start(
+        symbol=SYMBOL,
+        range_size=RANGE_SIZE,
+        rev=REV_BRICKS,
+        clean=CLEAN_MODE,
+        streak=STREAK_SIZE,
+        tp=TP_CLOSE_AFTER,
+        sl=FIXED_SL_POINTS,
+        risk=FLAT_RISK_DOLLARS,
+        live_trading=LIVE_TRADING,
     )
-    engine = StrategyEngine(streamer)
+    engine.warmup()
 
-    def on_bar(bar, gidx):
-        engine.on_bar(bar, gidx, is_warmup=is_warmup[0])
+    t = threading.Thread(target=engine.live_loop, daemon=True)
+    t.start()
 
-    streamer.on_bar_emit = on_bar
-
-    # ─── warmup ───
-    ok = warmup(streamer)
-    if not ok:
-        print("warmup failed, aborting"); sys.exit(1)
-
-    is_warmup[0] = False
-    telegram_bot.send_warmup_done(streamer.global_bar_count, len(streamer.bars))
-
-    # ─── live loop ───
-    last_tick_ts = mt5.symbol_info_tick(SYMBOL).time_msc
-    print(f"[live] entering main loop. last_tick_msc={last_tick_ts}")
-
+    print(f"[WEB] chart → http://localhost:{HTTP_PORT}")
     try:
-        while True:
-            try:
-                now_dt = datetime.now(timezone.utc)
-                from_ts = last_tick_ts + 1
-                new_ticks = mt5.copy_ticks_from(
-                    SYMBOL,
-                    datetime.fromtimestamp(from_ts / 1000.0, tz=timezone.utc),
-                    1000,
-                    mt5.COPY_TICKS_ALL,
-                )
-
-                if new_ticks is not None and len(new_ticks) > 0:
-                    for t in new_ticks:
-                        ts_msc = int(t["time_msc"])
-                        if ts_msc <= last_tick_ts:
-                            continue
-                        last_tick_ts = ts_msc
-
-                        ts = int(t["time"])
-                        bid = float(t["bid"]); ask = float(t["ask"]); last = float(t["last"])
-                        if bid > 0 and ask > 0: price = (bid + ask) / 2.0
-                        elif last > 0:          price = last
-                        elif bid > 0:           price = bid
-                        elif ask > 0:           price = ask
-                        else: continue
-                        vol = float(t["volume"])
-                        streamer.process_tick(ts, price, vol)
-
-                engine.poll_position_status()
-
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                telegram_bot.send_error(f"loop error: {e}")
-                print(f"[live] loop error: {e}")
-
-            time.sleep(TICK_POLL_INTERVAL)
-
-    except KeyboardInterrupt:
-        print("\n[live] shutting down…")
-        telegram_bot.send_status("Live engine stopped (manual).")
+        app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False)
     finally:
+        engine.running = False
         mt5.shutdown()
 
 
