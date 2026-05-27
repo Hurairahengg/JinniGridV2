@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <title>Koko Live</title>
-<script src="/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   html, body { margin: 0; padding: 0; background: #0e0e10; color: #e6e6e6;
                font-family: -apple-system, system-ui, sans-serif; height: 100%; overflow: hidden; }
@@ -48,12 +48,8 @@
 if (typeof LightweightCharts === "undefined") {
   document.body.innerHTML =
     "<div style='color:#ef5350;padding:20px;font-family:monospace;font-size:14px'>" +
-    "❌ <b>LightweightCharts library failed to load.</b><br><br>" +
-    "Make sure <code>lightweight-charts.standalone.production.js</code> is in the same folder as <code>live_engine.py</code>.<br><br>" +
-    "Download it:<br>" +
-    "<code>curl -O https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js</code><br><br>" +
-    "Verify Flask can serve it by opening:<br>" +
-    "<a href='/lightweight-charts.standalone.production.js' style='color:#42a5f5'>http://localhost:5000/lightweight-charts.standalone.production.js</a></div>";
+    "❌ <b>LightweightCharts CDN failed to load.</b><br>" +
+    "Check your internet / firewall. Open DevTools Console for the failing request.</div>";
   throw new Error("lib not loaded");
 }
 

@@ -667,9 +667,6 @@ app = Flask(__name__)
 def index():
     return send_from_directory(".", "chart.html")
 
-@app.route("/lightweight-charts.standalone.production.js")
-def lwc_lib():
-    return send_from_directory(".", "lightweight-charts.standalone.production.js")
 
 @app.route("/api/state")
 def state():
