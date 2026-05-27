@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 # ============================ CONFIG ============================
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
-CHAT_ID   = "PASTE_YOUR_CHAT_ID_HERE"
+BOT_TOKEN = '7320016249:AAH9wV_QttEVNnzlWw5wiqIvjWNgC1TQ4ow'  
+CHAT_ID = '-5124585879'
 ENABLED   = True
 TIMEOUT   = 5
 

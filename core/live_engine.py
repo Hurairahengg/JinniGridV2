@@ -37,7 +37,7 @@ COMMISSION_PER_LOT    = 0.8    # one-side, scales with lots
 POINT_VALUE_PER_LOT   = 1.0    # 1pt × 1lot = $1
 
 # Risk (scaling: 1$ per 100$ of balance)
-STARTING_BALANCE      = 1000.0
+STARTING_BALANCE      = 3100.0
 RISK_PER_100          = 1.0
 MIN_LOTS              = 0.01
 MAX_LOTS              = 600.0
@@ -228,6 +228,7 @@ class StrategyEngine:
     def __init__(self):
         self.positions     = []
         self.trades        = []
+        self.pending_validations = []
         self.validations   = []
         self.markers       = []
         self.warmup_done   = False
@@ -290,7 +291,7 @@ class StrategyEngine:
             "sl_price":      round(sl_price,    PRICE_DECIMALS),
             "lots":          lots,
             "entry_time":    signal_bar["time"],
-            "bars_held":     1,
+            "bars_held":     0,
             "mfe_points":    0.0,
             "mae_points":    0.0,
             "risk_used":     self._current_risk_dollars(),
@@ -374,14 +375,25 @@ class StrategyEngine:
         )
 
         if self._validate_fn is not None:
+            self.pending_validations.append(trade)
+            self._run_pending_validations()
+    def _run_pending_validations(self):
+        """Try to validate any closed trades whose backtest window now exists."""
+        still_pending = []
+        for trade in self.pending_validations:
             try:
-                v_result = self._validate_fn(trade)
-                self.validations.append(v_result)
-                print(validator.format_report(v_result))
-                tg.notify_validation(v_result)
+                v = self._validate_fn(trade)
+                if v["status"] == "SKIP" and any("insufficient post-signal" in i for i in v.get("issues", [])):
+                    # bars not built up yet; retry on next bar close
+                    still_pending.append(trade)
+                    continue
+                self.validations.append(v)
+                print(validator.format_report(v))
+                tg.notify_validation(v)
             except Exception as e:
                 print(f"[VALIDATOR-ERR] {e}")
-
+                still_pending.append(trade)
+        self.pending_validations = still_pending
     def on_tick(self, tick):
         if not self.positions:
             return
@@ -412,14 +424,16 @@ class StrategyEngine:
                     exit_price = bar["close"] + SLIPPAGE_POINTS
                 self._close_position(pos, exit_price, "TP", bar["time"])
 
-        # 2) scan for new signal (only when live)
+        # 2) scan for new signal
         if not self.warmup_done:
             return
         sig = self._check_signal(all_bars)
-        if sig == 0:
-            return
-        self._open_position(sig, bar)
+        if sig != 0:
+            self._open_position(sig, bar)
 
+        # 3) retry any deferred validations now that we have more bars
+        if self.pending_validations:
+            self._run_pending_validations()
     # ── MT5 EXECUTION ──────────────────────────────────────────
 
     def _send_mt5_order(self, pos):
@@ -479,6 +493,7 @@ class LiveEngine:
     def __init__(self):
         self.bars     = []
         self.strategy = StrategyEngine()
+        
         self.strategy._validate_fn = lambda trade: validator.validate(trade, self.bars)
         self.streamer = KokoCandleStreamer(
             range_size=RANGE_SIZE, price_decimals=PRICE_DECIMALS,
@@ -632,6 +647,7 @@ class LiveEngine:
                 "bars":             list(chart_bars),
                 "working_bar":      working,
                 "markers":          list(self.strategy.markers),
+                "pending_validations": len(self.strategy.pending_validations),
                 "trades":           list(self.strategy.trades),
                 "validations":      list(self.strategy.validations),
                 "positions":        [dict(p) for p in self.strategy.positions],
