@@ -26,11 +26,11 @@ from flask import Flask, jsonify, send_from_directory
 
 # ============================ CONFIG ============================
 
-SYMBOL                = "USTEC"          # adjust to your broker's symbol (NAS100, USTEC.cash, etc)
+SYMBOL                = "USTEC"
 RANGE_SIZE            = 8.0
 REV_BRICKS            = 2.0
 CLEAN_MODE            = True
-PRICE_DECIMALS        = 1
+PRICE_DECIMALS        = 2          # ← your broker shows 2 decimals
 WARMUP_BARS           = 100
 WARMUP_LOOKBACK_DAYS  = 7
 
@@ -39,11 +39,17 @@ STREAK_SIZE           = 2
 TP_CLOSE_AFTER        = 3
 FIXED_SL_POINTS       = 16.0
 SLIPPAGE_POINTS       = 0.3
-COMMISSION_PER_LOT    = 0.8
-FLAT_RISK_DOLLARS     = 10.0
+COMMISSION_PER_LOT    = 0.8        # fixed $ per lot, one-side, scales with lots
+POINT_VALUE_PER_LOT   = 1.0        # 1 point × 1 lot = $1 PnL
+
+# Risk / sizing (SCALING MODE: risk 1$ per 100$ balance)
+STARTING_BALANCE      = 3100.0     # ← edit to your real start capital
+RISK_PER_100          = 1.0        # 1.0 = risk $1 per $100 balance (1% per trade)
+MIN_LOTS              = 0.01
+MAX_LOTS              = 600.0
 
 # Execution
-LIVE_TRADING          = False            # ← flip to True to actually order_send
+LIVE_TRADING          = True       # ← ARMED. fires real MT5 orders.
 MAGIC_NUMBER          = 770808
 DEVIATION_POINTS      = 20
 TICK_POLL_MS          = 50
@@ -232,9 +238,20 @@ class StrategyEngine:
         self._trade_id_seq += 1
         return self._trade_id_seq
 
+    def _current_risk_dollars(self):
+        """Risk $ per trade: 1$ per 100$ of balance."""
+        balance = STARTING_BALANCE + self.equity
+        if balance <= 0:
+            return 0.0
+        return (balance / 100.0) * RISK_PER_100
+
     def _calc_lots(self):
-        raw = FLAT_RISK_DOLLARS / FIXED_SL_POINTS
-        return max(0.01, min(600.0, round(raw, 2)))
+        risk = self._current_risk_dollars()
+        if risk <= 0:
+            return 0.0
+        # 1 pt = $1 per 1 lot → lots = risk$ / SL_points so SL hit ≈ -risk$
+        raw = risk / FIXED_SL_POINTS
+        return max(MIN_LOTS, min(MAX_LOTS, round(raw, 2)))
 
     def _check_signal(self, bars):
         if len(bars) < STREAK_SIZE + 1:
@@ -264,11 +281,15 @@ class StrategyEngine:
             sl_price    = entry_price + FIXED_SL_POINTS
 
         lots = self._calc_lots()
+        if lots <= 0:
+            print(f"[NO ENTRY] balance non-positive, skipping signal")
+            return
         tid  = self._next_trade_id()
 
         pos = {
             "id":            tid,
             "dir":           direction,
+            "risk_used":     self._current_risk_dollars(),
             "entry_price":   round(entry_price, PRICE_DECIMALS),
             "sl_price":      round(sl_price,    PRICE_DECIMALS),
             "lots":          lots,
@@ -602,28 +623,31 @@ class LiveEngine:
         with self.lock:
             working = self.streamer.get_working_bar()
             return {
-                "bars":         list(self.bars),
-                "working_bar":  working,
-                "markers":      list(self.strategy.markers),
-                "trades":       list(self.strategy.trades),
-                "positions":    [dict(p) for p in self.strategy.positions],
-                "warmup_done":  self.strategy.warmup_done,
-                "validations":  list(self.strategy.validations),
-                "bar_count":    len(self.bars),
-                "equity":       round(self.strategy.equity, 2),
-                "last_price":   self.last_price,
-                "symbol":       SYMBOL,
-                "live_trading": LIVE_TRADING,
+                "bars":             list(self.bars),
+                "working_bar":      working,
+                "markers":          list(self.strategy.markers),
+                "trades":           list(self.strategy.trades),
+                "validations":      list(self.strategy.validations),
+                "positions":        [dict(p) for p in self.strategy.positions],
+                "warmup_done":      self.strategy.warmup_done,
+                "bar_count":        len(self.bars),
+                "equity":           round(self.strategy.equity, 2),
+                "balance":          round(STARTING_BALANCE + self.strategy.equity, 2),
+                "starting_balance": STARTING_BALANCE,
+                "last_price":       self.last_price,
+                "symbol":           SYMBOL,
+                "live_trading":     LIVE_TRADING,
                 "config": {
-                    "range":   RANGE_SIZE,
-                    "rev":     REV_BRICKS,
-                    "clean":   CLEAN_MODE,
-                    "streak":  STREAK_SIZE,
-                    "tp":      TP_CLOSE_AFTER,
-                    "sl":      FIXED_SL_POINTS,
-                    "risk":    FLAT_RISK_DOLLARS,
+                    "range":         RANGE_SIZE,
+                    "rev":           REV_BRICKS,
+                    "clean":         CLEAN_MODE,
+                    "streak":        STREAK_SIZE,
+                    "tp":            TP_CLOSE_AFTER,
+                    "sl":            FIXED_SL_POINTS,
+                    "risk_per_100":  RISK_PER_100,
                 },
             }
+        
 
 
 # ============================ FLASK ============================
